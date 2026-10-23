@@ -57,13 +57,19 @@ class LatestPlanTests(unittest.TestCase):
         self.addCleanup(workbook.close)
         return workbook
 
-    def appended_cell(self, sheet, header, row, label, original_columns):
-        columns = [
-            cell.column for cell in sheet[header]
-            if cell.column > original_columns and cell.value == label
-        ]
-        self.assertEqual(len(columns), 1, f"{sheet.title}: appended {label!r}")
-        return sheet.cell(row, columns[0])
+    def assert_original_columns(self, workbook):
+        self.assertEqual(workbook.sheetnames, ["加油明细记录", "发票", "Sheet1"])
+        for sheet, header, labels in [
+            (workbook.worksheets[0], 4, fixtures.FUEL_HEADERS),
+            (workbook.worksheets[1], 2, fixtures.INVOICE_HEADERS),
+        ]:
+            self.assertEqual(sheet.max_column, len(labels))
+            self.assertEqual([cell.value for cell in sheet[header]], labels)
+            self.assertTrue(all(cell.comment is None for row in sheet for cell in row))
+
+    def assert_only_fuel_rows_are_red(self, summary):
+        self.assertTrue(all(row["red"] for row in self.fuel_rows(summary)))
+        self.assertTrue(all(not row["red"] for row in self.invoice_rows(summary)))
 
     def assert_red_row(self, sheet, row):
         fixtures.ReconciliationContractTests.assert_red_row(self, sheet, row)
@@ -143,7 +149,7 @@ class LatestPlanTests(unittest.TestCase):
         self.assertEqual(summary["paired"], 0)
         self.assertEqual(len(summary["results"]), 2)
         self.assertEqual(self.invoice_rows(summary)[0]["status"], "待确认")
-        self.assertTrue(all(row["red"] for row in summary["results"]))
+        self.assert_only_fuel_rows_are_red(summary)
         self.assertEqual(self.first_fuel(summary)["status"], "无对应记录")
         included = self.run_case(start_text="2026-10-11", end_text="2026-10-12")
         self.assertEqual(included["matched"], 1)
@@ -167,10 +173,11 @@ class LatestPlanTests(unittest.TestCase):
         self.assertEqual(summary["matched"], 0)
         result = self.invoice_rows(summary)[0]
         self.assertEqual(result["status"], "待确认")
-        self.assertTrue(result["red"])
+        self.assertFalse(result["red"])
         workbook = self.open_result(summary)
-        sheet = workbook["发票"]
-        self.assertIsNone(sheet.cell(3, sheet.max_column).value)
+        self.assert_original_columns(workbook)
+        self.assertIsNone(result["fuel_end_time"])
+        self.assertEqual(result["invoice_time"], "2026-10-11 10:05:00")
 
     def test_discount_formula_without_cache_is_not_described_as_empty_zero(self):
         self.make_workbook([fixtures.fuel(优惠金额="=5+5")])
@@ -202,7 +209,7 @@ class LatestPlanTests(unittest.TestCase):
                 if status != "已匹配":
                     workbook = self.open_result(summary)
                     self.assert_red_row(workbook.worksheets[0], 5)
-                    self.assert_red_row(workbook.worksheets[1], 3)
+                    self.assertTrue(all(cell.fill.fill_type is None for cell in workbook.worksheets[1][3]))
 
     def test_amount_difference_has_priority_over_reversed_time(self):
         self.make_workbook(invoices=[fixtures.invoice(备注="交易时间：2026-10-11 09:59:59 油枪号：4", **{"合计金额（含税）": 100.01})])
@@ -215,64 +222,62 @@ class LatestPlanTests(unittest.TestCase):
         self.assertTrue(any(word in result["basis"] for word in ("早于", "倒置", "先后", "负")))
         self.assertTrue(result["red"])
 
-    def test_three_time_fields_and_last_completion_column_are_exported(self):
+    def test_three_time_fields_are_in_results_and_log_without_adding_columns(self):
         self.make_workbook(invoices=[fixtures.invoice(备注="交易时间：2026-10-11 10:05:00 油枪号：4", 开票时间="2026-10-11 11:00:00")])
         summary = self.run_case()
         workbook = self.open_result(summary)
-        for sheet, header, row, original_columns in [
-            (workbook.worksheets[0], 4, 5, len(fixtures.FUEL_HEADERS)),
-            (workbook.worksheets[1], 2, 3, len(fixtures.INVOICE_HEADERS)),
-        ]:
-            for label, expected in [
-                ("加油开始时间", datetime(2026, 10, 11, 10)),
-                ("加油结束时间", datetime(2026, 10, 11, 10, 5)),
-                ("开票时间", datetime(2026, 10, 11, 11)),
+        self.assert_original_columns(workbook)
+        log = Path(summary["log_path"]).read_text(encoding="utf-8")
+        for result in summary["results"]:
+            for key, expected in [
+                ("fuel_start_time", "2026-10-11 10:00:00"),
+                ("fuel_end_time", "2026-10-11 10:05:00"),
+                ("invoice_time", "2026-10-11 11:00:00"),
             ]:
-                cell = self.appended_cell(sheet, header, row, label, original_columns)
-                self.assertEqual(cell.value, expected)
-                self.assertIn("hh:mm:ss", cell.number_format)
-        invoice_sheet = workbook.worksheets[1]
-        self.assertEqual(invoice_sheet.cell(2, invoice_sheet.max_column).value, "加油完成时间")
-        self.assertEqual(invoice_sheet.cell(3, invoice_sheet.max_column).value, datetime(2026, 10, 11, 10, 5))
+                self.assertEqual(result[key], expected)
+                self.assertIn(expected, log)
+        for label in ("加油开始时间", "加油结束时间", "开票时间"):
+            self.assertIn(label, log)
 
     def test_fallback_invoice_time_does_not_become_fueling_end_time(self):
         self.make_workbook(invoices=[fixtures.invoice(备注="油枪号：4", 开票时间="2026-10-11 10:05:00")])
         summary = self.run_case(start_text="2026-10-11 10:00", end_text="2026-10-11 10:05")
         self.assertEqual(summary["matched"], 1)
         workbook = self.open_result(summary)
-        for sheet, header, row, original_columns in [
-            (workbook.worksheets[0], 4, 5, len(fixtures.FUEL_HEADERS)),
-            (workbook.worksheets[1], 2, 3, len(fixtures.INVOICE_HEADERS)),
-        ]:
-            self.assertIsNone(self.appended_cell(sheet, header, row, "加油结束时间", original_columns).value)
-            self.assertEqual(self.appended_cell(sheet, header, row, "开票时间", original_columns).value, datetime(2026, 10, 11, 10, 5))
-        invoice_sheet = workbook.worksheets[1]
-        self.assertIsNone(invoice_sheet.cell(3, invoice_sheet.max_column).value)
+        self.assert_original_columns(workbook)
+        for result in summary["results"]:
+            self.assertIsNone(result["fuel_end_time"])
+            self.assertEqual(result["invoice_time"], "2026-10-11 10:05:00")
         self.assertIn("开票时间", self.first_fuel(summary)["basis"])
 
-    def test_success_detail_is_identical_complete_wrapped_and_text_safe(self):
+    def test_success_detail_is_identical_complete_in_log_and_preserves_sheet_layout(self):
         card = "0001234567890123456789012345"
         number = "0026447200000093907128"
         self.make_workbook(
             [fixtures.fuel(卡号=card, 交易金额=290.19, 优惠金额=9.81, 加油量=38.4)],
             [fixtures.invoice(数电票号码=number, 数量=38.4, 备注="交易时间：2026-10-11 10:05:00 油枪号：4", 开票时间="2026-10-11 11:00:00", **{"合计金额（含税）": 280.38})],
         )
+        original = load_workbook(self.input_path)
+        original.worksheets[0].row_dimensions[5].height = 21.5
+        original.worksheets[1].row_dimensions[3].height = 23
+        original.worksheets[0].column_dimensions["C"].width = 25.75
+        original.worksheets[1].column_dimensions["E"].width = 30.5
+        original.save(self.input_path)
+        original.close()
         summary = self.run_case()
         self.assertEqual(summary["matched"], 1)
         workbook = self.open_result(summary)
-        details = []
-        for sheet, header, row, original_columns in [
-            (workbook.worksheets[0], 4, 5, len(fixtures.FUEL_HEADERS)),
-            (workbook.worksheets[1], 2, 3, len(fixtures.INVOICE_HEADERS)),
-        ]:
-            cell = self.appended_cell(sheet, header, row, "匹配明细", original_columns)
-            details.append(cell.value)
-            self.assertIsInstance(cell.value, str)
-            self.assertTrue(cell.alignment.wrap_text)
-            self.assertGreater(sheet.column_dimensions[cell.column_letter].width, 30)
-            self.assertGreater(sheet.row_dimensions[row].height or 0, 50)
+        self.assert_original_columns(workbook)
+        details = [result["match_details"] for result in summary["results"]]
+        self.assertEqual(len(details), 2)
+        self.assertTrue(all(isinstance(detail, str) for detail in details))
+        self.assertEqual(workbook.worksheets[0].row_dimensions[5].height, 21.5)
+        self.assertEqual(workbook.worksheets[1].row_dimensions[3].height, 23)
+        self.assertEqual(workbook.worksheets[0].column_dimensions["C"].width, 25.75)
+        self.assertEqual(workbook.worksheets[1].column_dimensions["E"].width, 30.5)
         self.assertEqual(details[0], details[1])
         detail = details[0]
+        self.assertIn(detail, Path(summary["log_path"]).read_text(encoding="utf-8"))
         self.assertIn("\n", detail)
         for text in [card, number, "加油明细记录", "发票", "95", "38.4", "290.19", "9.81", "280.38", "2026-10-11 10:00:00", "2026-10-11 10:05:00", "2026-10-11 11:00:00"]:
             self.assertIn(text, detail)
@@ -300,13 +305,16 @@ class LatestPlanTests(unittest.TestCase):
                 summary = self.run_case()
                 self.assertEqual(summary["matched"], 0)
                 workbook = self.open_result(summary)
+                self.assert_original_columns(workbook)
                 for result in summary["results"]:
                     sheet = workbook[result["source"]]
                     is_fuel = result["source"] == "加油明细记录"
-                    cell = self.appended_cell(sheet, 4 if is_fuel else 2, result["row"], "匹配明细", len(fixtures.FUEL_HEADERS) if is_fuel else len(fixtures.INVOICE_HEADERS))
-                    self.assertIsNone(cell.value)
-                    self.assertTrue(result["red"])
-                    self.assert_red_row(sheet, result["row"])
+                    self.assertIsNone(result["match_details"])
+                    self.assertEqual(result["red"], is_fuel)
+                    if is_fuel:
+                        self.assert_red_row(sheet, result["row"])
+                    else:
+                        self.assertTrue(all(cell.fill.fill_type is None for cell in sheet[result["row"]]))
 
     def test_station_brand_prefix_can_match_single_station(self):
         self.make_workbook(
@@ -334,7 +342,7 @@ class LatestPlanTests(unittest.TestCase):
         )
         summary = self.run_case()
         self.assertEqual(summary["matched"], 0)
-        self.assertTrue(all(row["red"] for row in summary["results"]))
+        self.assert_only_fuel_rows_are_red(summary)
 
     def test_missing_station_evidence_is_not_success_in_multi_station_file(self):
         self.make_workbook(
@@ -344,7 +352,7 @@ class LatestPlanTests(unittest.TestCase):
         summary = self.run_case()
         self.assertEqual(summary["matched"], 0)
         self.assertEqual(len(summary["results"]), 4)
-        self.assertTrue(all(row["red"] for row in summary["results"]))
+        self.assert_only_fuel_rows_are_red(summary)
 
     def test_duplicate_pairs_explicitly_mark_time_order_inference(self):
         self.make_workbook(

@@ -34,15 +34,15 @@ HELP_TEXT = """加华加油与发票核对助手使用说明
 
 5. 同枪号、同油品、同升数的重复候选按双方时间顺序一一配对，注明“按时间顺序推定”，不能为使金额相等而调换顺序。每笔记录只使用一次；重复票号、同票多行或其他证据不足的情况标为待确认。
 
-6. 金额只要有差异，即使相差 0.01 元，也判为“金额不符”并整行标浅红底。多项问题全部写入配对依据，存在金额差时主状态优先显示金额不符。其他不符、无对应记录、待确认也标浅红底；保留疑似对应位置及差异供核查。
+6. 金额只要有差异，即使相差 0.01 元，也判为“金额不符”，加油明细对应原行整行标浅红底。其他不符、无对应记录、待确认的加油原行也标浅红底；发票页保持原样，不新增标红。多项问题、疑似对应位置及差异写入核对日志和界面预览，存在金额差时主状态优先显示金额不符。
 
-7. 备注缺少结束时间时，允许使用开票时间辅助判断并注明来源，加油结束时间保持空白；备注时间存在但格式无效时标为待确认。发票页最右侧“加油完成时间”继续严格取备注时间，缺失时留空。
+7. 备注缺少结束时间时，允许使用开票时间辅助判断并注明来源，日志和预览中的加油结束时间保持空白；备注时间存在但格式无效时标为待确认。备注交易时间、油枪号及时间来源在日志和预览中展示。
 
-8. 结果另存到输出目录，重名时自动追加序号。前两页原表右侧追加结果，不新增异常切页，保留原始字段、其他工作表、合计行、完整卡号和发票号码。时间段之外的记录保留并注明未参与核对。
+8. 结果工作簿另存到输出目录，重名时自动追加序号。Excel 前两页不新增核对列或批注，不新增切页；保留原始字段、其他工作表、合计行、完整卡号和发票号码，仅在加油明细原行标红，发票页保持原样。时间段之外的原记录保留，不参与本次核对。
 
-9. 前两页各有“匹配明细”列，仅“已匹配”记录填写，双方显示相同的枪号、卡号、油品、完整票号、三个时间、双方升数、各项金额及原始位置。预览可横向滚动，双击记录可查看完整多行内容；异常记录的匹配明细留空。
+9. 与结果工作簿同名的 .log 文件单独保存全部核对详情，包括对应记录位置、应开票金额、实际发票金额、金额差、升数差、时间差、状态、配对依据和成功记录的匹配明细。明细包含枪号、卡号、油品、完整票号、三个时间、双方升数、各项金额及原始位置。点击“打开核对日志”查看；界面预览可横向滚动，双击记录可查看完整内容。
 
-10. “仅显示红底”和状态下拉框可组合筛选预览，不会减少导出记录。结果工作簿支持按核对状态或浅红底颜色筛选。“金额差”＝实际发票金额－应开票金额；“升数差”＝发票升数－加油升数；时间差保留正负号。统计中的“对应”和“已匹配”按一对加油与发票计数，双方红底行数分别统计。
+10. “仅显示红底”和状态下拉框可组合筛选预览，不会减少工作簿或日志中的记录。仅加油侧异常记录显示红底，发票侧不标红；所有发票核对结果仍可在预览和日志中查看。“金额差”＝实际发票金额－应开票金额；“升数差”＝发票升数－加油升数；时间差保留正负号。统计中的“对应”和“已匹配”按一对加油与发票计数。
 """
 
 
@@ -107,8 +107,8 @@ class ReconciliationApp:
         self.busy = False
         self.results: list[dict] = []
         self.output_path: Path | None = None
+        self.log_path: Path | None = None
         self.help_window: tk.Toplevel | None = None
-        self.brand_logo: tk.PhotoImage | None = None
         self.setting_controls: list[ttk.Widget] = []
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
@@ -129,8 +129,6 @@ class ReconciliationApp:
         style.configure("Page.TLabel", background=page, foreground=text)
         style.configure("Rule.TLabel", background=page, foreground=blue)
         style.configure("Footer.TLabel", background=page, foreground="#63778A")
-        style.configure("Header.TFrame", background="#DDE8F6")
-        style.configure("Header.TLabel", background="#DDE8F6", foreground=blue)
         style.configure("Card.TLabelframe", background="#FFFFFF", bordercolor="#D7E3F0", borderwidth=1, relief="solid")
         style.configure("Card.TLabelframe.Label", background="#FFFFFF", foreground=blue, font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("TEntry", fieldbackground="#FFFFFF", foreground=text, padding=6, bordercolor="#CAD9E9", lightcolor="#FFFFFF", darkcolor="#FFFFFF")
@@ -152,20 +150,6 @@ class ReconciliationApp:
         style.configure("Horizontal.TProgressbar", background="#4E86BA", troughcolor="#EEF4FC", bordercolor="#D7E3F0")
         outer = ttk.Frame(self.root, padding=20, style="Page.TFrame")
         outer.pack(fill="both", expand=True)
-        header = ttk.Frame(outer, padding=(16, 10), style="Header.TFrame")
-        header.pack(fill="x", pady=(0, 16))
-        logo_path = application_asset_path("gawa.png")
-        if logo_path.is_file():
-            try:
-                logo = tk.PhotoImage(file=str(logo_path))
-                factor = max(1, (max(logo.width(), logo.height()) + 47) // 48)
-                self.brand_logo = logo.subsample(factor, factor) if factor > 1 else logo
-                ttk.Label(header, image=self.brand_logo, style="Header.TLabel").pack(side="left", padx=(0, 12))
-            except tk.TclError:
-                pass
-        ttk.Label(header, text="加油与发票数据核对", font=("Microsoft YaHei UI", 18, "bold"), style="Header.TLabel").pack(side="left")
-        ttk.Button(header, text="使用帮助", command=self._show_help).pack(side="right")
-
         form = ttk.LabelFrame(outer, text="核对设置", padding=(14, 10), style="Card.TLabelframe")
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
@@ -196,15 +180,19 @@ class ReconciliationApp:
         self.run_button.pack(side="left")
         self.open_button = ttk.Button(actions, text="打开结果工作簿", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(8, 0))
+        self.log_button = ttk.Button(actions, text="打开核对日志", command=self._open_log, state="disabled")
+        self.log_button.pack(side="left", padx=(8, 0))
         self.folder_button = ttk.Button(actions, text="打开输出目录", command=self._open_output)
         self.folder_button.pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="使用帮助", command=self._show_help).pack(side="right")
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=140)
-        self.progress.pack(side="right", padx=(12, 0))
+        self.progress.pack(side="right", padx=(12, 12))
 
         rules = ttk.Label(
             outer,
             text="核对规则：应开票＝交易金额－优惠；金额零差额、升数一致；结束－开始在 0—30 分钟内（含边界）。\n"
-                 "发票备注交易时间为结束，结合油枪号和油品配对；缺失时用开票时间辅助，金额有差异均判金额不符并标红。",
+                 "发票备注交易时间为结束，结合油枪号和油品配对；缺失时用开票时间辅助。\n"
+                 "Excel 保留原字段，仅加油明细异常原行标红，发票页保持原样；全部核对详情另存同名 .log，并显示在预览中。",
             style="Rule.TLabel",
             justify="left",
         )
@@ -215,7 +203,7 @@ class ReconciliationApp:
         footer.pack(side="bottom", fill="x", pady=(8, 0))
         status_label = ttk.Label(footer, textvariable=self.status_text, wraplength=1040, style="Page.TLabel")
         status_label.pack(anchor="w", fill="x")
-        ttk.Label(footer, text="原文件保留；结果另存。预览筛选不影响导出记录。双击预览行可查看完整依据。", style="Footer.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(footer, text="原文件保留；工作簿仅加油原行标红，发票保持原样。详情见同名 .log 或双击预览行。", style="Footer.TLabel").pack(anchor="w", pady=(4, 0))
         footer.bind("<Configure>", lambda event: status_label.configure(wraplength=max(1, event.width)))
 
         result_frame = ttk.LabelFrame(outer, text="原表两侧记录预览", padding=10, style="Card.TLabelframe")
@@ -287,7 +275,9 @@ class ReconciliationApp:
             return
         self.busy = True
         self.output_path = None
+        self.log_path = None
         self.open_button.configure(state="disabled")
+        self.log_button.configure(state="disabled")
         self.run_button.configure(state="disabled")
         self.folder_button.configure(state="disabled")
         for control in self.setting_controls:
@@ -317,14 +307,16 @@ class ReconciliationApp:
                 elif event == "done":
                     self._finish_run()
                     self.output_path = Path(payload["output_path"])
+                    self.log_path = Path(payload["log_path"])
                     self.results = payload.get("results", [])
                     self.open_button.configure(state="normal")
+                    self.log_button.configure(state="normal")
                     self.summary_text.set(
                         f"加油记录 {payload['total_fuel']} 条　发票记录 {payload['total_invoice']} 条　对应 {payload['paired']} 对　"
                         f"已匹配 {payload['matched']} 对，其余需核查\n"
-                        f"红底：加油侧 {payload['red_fuel']} 条，发票侧 {payload['red_invoice']} 条"
+                        f"加油明细红底 {payload['red_fuel']} 条；发票页保持原样。全部核对详情见同名 .log 和下方预览。"
                     )
-                    self.status_text.set(f"核对完成，结果已保存：{self.output_path}")
+                    self.status_text.set(f"核对完成，工作簿：{self.output_path}\n核对日志：{self.log_path}")
                     self._refresh_preview()
                 elif event == "error":
                     self._finish_run()
@@ -403,6 +395,13 @@ class ReconciliationApp:
                 self._open_path(self.output_path)
             else:
                 messagebox.showerror("结果文件不存在", f"结果文件可能已被移动或删除：\n{self.output_path}", parent=self.root)
+
+    def _open_log(self) -> None:
+        if self.log_path is not None:
+            if self.log_path.is_file():
+                self._open_path(self.log_path)
+            else:
+                messagebox.showerror("核对日志不存在", f"日志文件可能已被移动或删除：\n{self.log_path}", parent=self.root)
 
     def _open_output(self) -> None:
         path = self.output_path.parent if self.output_path else Path(self.output_directory.get().strip() or self.base_directory / "outputs")

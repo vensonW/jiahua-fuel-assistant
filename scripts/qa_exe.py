@@ -16,7 +16,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--icon-only", action="store_true", help="Only inspect the embedded EXE icon")
 args = parser.parse_args()
 exe = root / "加华加油与发票核对助手.exe"
-qa = root / "outputs" / "qa" / ("red_exe_icon" if args.icon_only else "latest_period")
+qa = root / "outputs" / "qa" / ("red_exe_icon" if args.icon_only else "original_marking")
 qa.mkdir(parents=True, exist_ok=True)
 summary_path = qa / "exe_summary.json"
 arguments = [str(exe), "--input", str(root / "中南加华加油和开票数据核对.xlsx"),
@@ -27,6 +27,11 @@ if not args.icon_only:
     subprocess.run(arguments, check=True, timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["paired"] == 97 and summary["matched"] == 15
+    assert summary["red_fuel"] == 82 and summary["red_invoice"] == 0
+    log_path = Path(summary["log_path"])
+    assert log_path == Path(summary["output_path"]).with_suffix(".log")
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "加油开始时间" in log_text and "匹配明细" in log_text
     assert summary["period_start"] == "2026-10-11 00:00:00"
     assert summary["period_end"] == "2026-10-11 23:59:59.999999"
     subprocess.run([str(exe), "--smoke-gui"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)

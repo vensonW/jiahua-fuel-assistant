@@ -12,7 +12,7 @@ project = Path(__file__).resolve().parent.parent
 set_application_id()
 root = tk.Tk()
 app = ReconciliationApp(root)
-qa = project / "outputs" / "qa" / "latest_period"
+qa = project / "outputs" / "qa" / "original_marking"
 qa.mkdir(parents=True, exist_ok=True)
 app.output_directory.set(str(qa / "gui_run"))
 app.start_text.set("2026-10-11 21:28:03")
@@ -23,6 +23,9 @@ while app.busy and time.monotonic() < deadline:
     root.update()
     time.sleep(0.02)
 assert not app.busy and app.output_path and app.output_path.is_file(), app.status_text.get()
+assert app.log_path and app.log_path.is_file()
+assert app.log_path == app.output_path.with_suffix(".log")
+assert str(app.log_button["state"]) != "disabled"
 assert len(app.result_table.get_children()) == 194
 assert {"fuel_start_time", "fuel_end_time", "invoice_time", "match_details"} <= set(app.result_table["columns"])
 assert all(item.get("fuel_completion_time") for item in app.results)
@@ -30,7 +33,7 @@ assert sum(bool(item.get("match_details")) for item in app.results) == 30
 assert application_icon_path().is_file()
 app.red_only.set(True)
 app._refresh_preview()
-assert len(app.result_table.get_children()) == 164
+assert len(app.result_table.get_children()) == 82
 app.red_only.set(False)
 app.status_filter.set("已匹配")
 app._refresh_preview()
@@ -60,5 +63,5 @@ details = [window for window in root.winfo_children() if isinstance(window, tk.T
 details_hwnd = ctypes.windll.user32.GetAncestor(details.winfo_id(), 2)
 assert ctypes.windll.user32.SendMessageW(details_hwnd, 0x007F, 0, 0)
 details.destroy()
-print("GUI time range, brand icons, 194-row preview, 164 red rows, 30 successful details: passed")
+print("GUI single title, transparent window icon, log button, 194-row preview and 82 fuel red rows: passed")
 root.destroy()

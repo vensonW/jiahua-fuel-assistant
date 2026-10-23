@@ -11,24 +11,19 @@ from pathlib import Path
 import os
 import re
 import tempfile
-import math
-import unicodedata
 import time as clock_time
 from typing import Callable
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import PatternFill
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.filters import ColorFilter, FilterColumn
 
 
 RED = "FFFFC7CE"
-HEADERS = ["对应记录位置", "对应发票号码", "应开票金额", "实际发票金额",
-           "金额差（实际-应开）", "升数差（发票-加油）", "时间差（分钟）",
-           "核对状态", "配对依据", "时间来源", "加油开始时间", "加油结束时间", "开票时间", "匹配明细"]
 FUEL_ALIASES = {
     "gun": ["枪号", "油枪号"], "time": ["交易时间", "加油时间"],
     "oil": ["油品", "油品名称"], "volume": ["加油量", "升数", "加油升数"],
@@ -464,6 +459,9 @@ def _pair_result(a, b, amount_limit, seconds_limit, duplicate=False):
                   fuel_completion_time=_format_time(b.end_time),
                   fuel_start_time=_format_time(a.time), fuel_end_time=_format_time(b.end_time),
                   invoice_time=_format_time(b.invoice_time), match_details=_detail(a, b) if status == "已匹配" else None,
+                  gun=a.gun, card=a.card, oil=a.oil, station=a.station or b.station,
+                  fuel_volume=_plain(a.volume), invoice_volume=_plain(b.volume),
+                  trade_amount=_plain(a.trade), discount_amount=_plain(a.discount),
                   red=status != "已匹配" or amount_diff != 0)
     return [dict(common, source=a.source, row=a.row, counterpart=f"'{b.source}'!A{b.row}", invoice_number=b.number),
             dict(common, source=b.source, row=b.row, counterpart=f"'{a.source}'!A{a.row}", invoice_number=b.number)]
@@ -485,6 +483,10 @@ def _unpaired_result(record):
                 fuel_start_time=_format_time(record.time) if record.kind == "fuel" else None,
                 fuel_end_time=_format_time(record.end_time), invoice_time=_format_time(record.invoice_time),
                 match_details=None,
+                gun=record.gun, card=record.card, oil=record.oil, station=record.station,
+                fuel_volume=_plain(record.volume) if record.kind == "fuel" else None,
+                invoice_volume=_plain(record.volume) if record.kind == "invoice" else None,
+                trade_amount=_plain(record.trade), discount_amount=_plain(record.discount),
                 time_source=record.time_source, red=True)
 
 
@@ -525,63 +527,22 @@ def _export(wb, configurations, results, path, red_only, invoice_source):
         by_source[result["source"]].append(result)
     red_fill = PatternFill("solid", fgColor=RED)
     for ws, header, original_columns, records in configurations:
-        headers = HEADERS + (["加油完成时间"] if ws.title == invoice_source else [])
-        start = original_columns + 1
-        end = original_columns + len(headers)
-        for offset, label in enumerate(headers):
-            cell = ws.cell(header, start + offset, label)
-            cell.fill = PatternFill("solid", fgColor="FF245979")
-            cell.font = Font(name="微软雅黑", size=10, color="FFFFFFFF", bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            ws.column_dimensions[get_column_letter(start + offset)].width = [27, 26, 18, 18, 24, 24, 20, 26, 105, 30, 26, 26, 26, 86, 26][offset]
-        ws.row_dimensions[header].height = max(ws.row_dimensions[header].height or 15, 32)
+        if ws.title == invoice_source:
+            continue
         for result in by_source[ws.title]:
             row = result["row"]
-            values = [result["counterpart"], result["invoice_number"], result["expected"], result["actual"],
-                      result["amount_diff"], result["volume_diff"], result["time_diff"],
-                      result["status"], result["basis"], result["time_source"], result["fuel_start_time"],
-                      result["fuel_end_time"], result["invoice_time"], result["match_details"]]
-            if ws.title == invoice_source:
-                values.append(result["fuel_completion_time"])
-            for offset, value in enumerate(values):
-                cell = ws.cell(row, start + offset)
-                if offset in (10, 11, 12, 14):
-                    cell.value = datetime.fromisoformat(value) if value else None
-                    cell.number_format = "yyyy-mm-dd hh:mm:ss"
-                elif 2 <= offset <= 6 and value is not None:
-                    cell.value = float(Decimal(value))
-                    cell.number_format = "0.00########" if offset <= 4 else "0.########"
-                else:
-                    cell.value = value
-                    cell.data_type = "s" if isinstance(value, str) else cell.data_type
-                cell.font = Font(name="微软雅黑", size=10, color="FF202B36")
-                cell.alignment = Alignment(vertical="top" if offset == 13 else "center",
-                                           horizontal="right" if 2 <= offset <= 6 else "left", wrap_text=offset == 13)
-                if offset == 13:
-                    cell.number_format = "@"
-                    if value:
-                        lines = sum(max(1, math.ceil(sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in line) / 80)) for line in value.splitlines())
-                        ws.row_dimensions[row].height = min(409, max(ws.row_dimensions[row].height or 15, lines * 15 + 8))
-            link = ws.cell(row, start)
-            if result["counterpart"]:
-                link.hyperlink = "#" + result["counterpart"]
-                link.font = Font(name="微软雅黑", size=10, color="FF0563C1", underline="single")
-            ws.cell(row, start + 1).number_format = "@"
             if result["red"]:
-                for cell in ws.iter_rows(min_row=row, max_row=row, min_col=1, max_col=end):
-                    for item in cell:
-                        item.fill = copy(red_fill)
-            ws.row_dimensions[row].hidden = bool(red_only and not result["red"])
+                for cells in ws.iter_rows(min_row=row, max_row=row, min_col=1, max_col=original_columns):
+                    for cell in cells:
+                        cell.fill = copy(red_fill)
+            if red_only:
+                ws.row_dimensions[row].hidden = not result["red"]
         last_record = max((r.row for r in records), default=header)
-        ws.auto_filter.ref = f"A{header}:{get_column_letter(end)}{last_record}"
+        ws.auto_filter.ref = f"A{header}:{get_column_letter(original_columns)}{last_record}"
         ws.auto_filter.filterColumn = []
         if red_only:
             dxf_id = wb._differential_styles.add(DifferentialStyle(fill=red_fill))
-            ws.auto_filter.filterColumn.append(FilterColumn(colId=start + 6, colorFilter=ColorFilter(dxfId=dxf_id, cellColor=True)))
-        ws.freeze_panes = f"C{header + 1}"
-        ws.sheet_view.zoomScale = 85
-    if wb.calculation is not None:
-        wb.calculation.fullCalcOnLoad = True
+            ws.auto_filter.filterColumn.append(FilterColumn(colId=0, colorFilter=ColorFilter(dxfId=dxf_id, cellColor=True)))
     wb.save(path)
 
 
@@ -636,7 +597,10 @@ def _preserve_cell_values(original, output):
         except BaseException:
             staged.unlink(missing_ok=True)
             raise
-    _replace_file(staged, output)
+    try:
+        _replace_file(staged, output)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _verify_saved(path, configurations, results, invoice_source):
@@ -648,35 +612,84 @@ def _verify_saved(path, configurations, results, invoice_source):
         for result in results:
             header, original_columns, _ = config_by_name[result["source"]]
             ws = check[result["source"]]
-            status = ws.cell(result["row"], original_columns + 8).value
-            if status != result["status"]:
-                raise RuntimeError("输出记录状态校验失败")
-            end = original_columns + len(HEADERS) + (1 if ws.title == invoice_source else 0)
-            if result["red"] and any(ws.cell(result["row"], c).fill.fgColor.rgb != RED for c in range(1, end + 1)):
+            if result["red"] and any(ws.cell(result["row"], c).fill.fgColor.rgb != RED for c in range(1, original_columns + 1)):
                 raise RuntimeError("输出整行红底校验失败")
-            if ws.title == invoice_source:
-                cell = ws.cell(result["row"], end)
-                expected_time = result["fuel_completion_time"]
-                expected_time = datetime.fromisoformat(expected_time) if expected_time else None
-                if ws.cell(header, end).value != "加油完成时间" or cell.value != expected_time:
-                    raise RuntimeError("备注加油完成时间提取校验失败")
-            for offset, key in ((11, "fuel_start_time"), (12, "fuel_end_time"), (13, "invoice_time")):
-                expected_time = datetime.fromisoformat(result[key]) if result[key] else None
-                if ws.cell(result["row"], original_columns + offset).value != expected_time:
-                    raise RuntimeError("开始/结束/开票时间写入校验失败")
-            detail = ws.cell(result["row"], original_columns + 14).value
-            if detail != result["match_details"] or bool(detail) != (result["status"] == "已匹配"):
-                raise RuntimeError("匹配明细写入或成功状态校验失败")
         for source_ws, header, original_columns, records in configurations:
             target_ws = check[source_ws.title]
-            if not target_ws.auto_filter.ref:
+            if target_ws.max_column != original_columns:
+                raise RuntimeError("原表列数发生变化")
+            if source_ws.title != invoice_source and not target_ws.auto_filter.ref:
                 raise RuntimeError("输出筛选范围缺失")
+            if source_ws.title == invoice_source:
+                if (source_ws.auto_filter != target_ws.auto_filter
+                        or source_ws.freeze_panes != target_ws.freeze_panes
+                        or source_ws.sheet_view.zoomScale != target_ws.sheet_view.zoomScale):
+                    raise RuntimeError("发票原有筛选或视图发生变化")
             for row in source_ws.iter_rows(max_col=original_columns):
                 for cell in row:
-                    if target_ws.cell(cell.row, cell.column).value != cell.value:
+                    saved = target_ws.cell(cell.row, cell.column)
+                    if saved.value != cell.value:
                         raise RuntimeError(f"原始字段未完整保留：{source_ws.title}!{cell.coordinate}")
+                    original_note = (cell.comment.text, cell.comment.author) if cell.comment else None
+                    saved_note = (saved.comment.text, saved.comment.author) if saved.comment else None
+                    if original_note != saved_note:
+                        raise RuntimeError("原表批注发生变化")
+                    if source_ws.title == invoice_source and copy(saved.fill) != copy(cell.fill):
+                        raise RuntimeError("发票原有标色发生变化")
     finally:
         check.close()
+
+
+def _reserve_output_pair(directory, base_name):
+    suffix = 1
+    while True:
+        stem = base_name + ("" if suffix == 1 else "_" + str(suffix))
+        workbook_path, log_path = directory / (stem + ".xlsx"), directory / (stem + ".log")
+        try:
+            with workbook_path.open("xb"):
+                pass
+        except FileExistsError:
+            suffix += 1
+            continue
+        try:
+            with log_path.open("xb"):
+                pass
+        except FileExistsError:
+            workbook_path.unlink()
+            suffix += 1
+            continue
+        except BaseException:
+            workbook_path.unlink(missing_ok=True)
+            raise
+        return workbook_path, log_path
+
+
+def _write_log(path, input_path, report):
+    labels = [("counterpart", "对应记录位置"), ("invoice_number", "完整发票号码"),
+              ("station", "油站"), ("gun", "枪号"), ("card", "卡号"), ("oil", "油品"),
+              ("fuel_start_time", "加油开始时间"), ("fuel_end_time", "加油结束时间"),
+              ("invoice_time", "开票时间"), ("fuel_completion_time", "加油完成时间"),
+              ("time_source", "时间来源"), ("fuel_volume", "加油升数"), ("invoice_volume", "发票升数"),
+              ("trade_amount", "交易金额"), ("discount_amount", "优惠金额"),
+              ("expected", "应开票金额"), ("actual", "实际发票金额"),
+              ("amount_diff", "金额差（实际-应开）"), ("volume_diff", "升数差（发票-加油）"),
+              ("time_diff", "时间差（结束-开始，分钟）"), ("basis", "配对依据")]
+    with Path(path).open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write("加华加油与发票核对日志\n")
+        stream.write(f"源文件：{input_path}\n核对时间段：{report['date']}\n")
+        stream.write(f"加油记录：{report['total_fuel']}；发票记录：{report['total_invoice']}；对应：{report['paired']}对；已匹配：{report['matched']}对\n")
+        stream.write(f"仅加油明细新增浅红标记：{report['red_fuel']}行；发票页保持原样\n")
+        stream.write("金额严格零差额，升数完全一致；结束-开始在0—30分钟内。\n")
+        for result in report["results"]:
+            stream.write("\n" + "=" * 72 + "\n")
+            stream.write(f"[{result['source']}!A{result['row']}]\n")
+            stream.write(f"来源工作表：{result['source']}\n原始行号：{result['row']}\n核对状态：{result['status']}\n")
+            for key, label in labels:
+                value = result.get(key)
+                stream.write(f"{label}：{'' if value is None else value}\n")
+            stream.write("匹配明细：\n")
+            if result.get("match_details"):
+                stream.write(result["match_details"] + "\n")
 
 
 def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_tolerance="0",
@@ -701,6 +714,8 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         raise ReconciliationError(f"无法读取工作簿，请确认文件未损坏或加密：{exc}") from exc
     temporary_path = None
     reserved_path = None
+    temporary_log_path = None
+    reserved_log_path = None
     try:
         if len(wb.worksheets) < 2:
             raise ReconciliationError("工作簿至少需要两页：加油明细与发票")
@@ -736,6 +751,9 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
                     r.issues.append("涉及多个油站但该记录未提供油站，需人工确认，不跨站推断")
         notify(f"已读取加油{len(fuel)}笔、发票{len(invoices)}笔，正在按时间顺序一对一核对…")
         results, paired = _match(fuel, invoices, amount_limit, minutes_limit * 60)
+        for result in results:
+            if result["source"] == sources["invoice"]:
+                result["red"] = False
         source_order = {ws.title: i for i, ws in enumerate(wb.worksheets)}
         results.sort(key=lambda r: (source_order[r["source"]], r["row"]))
         positions = {(r["source"], r["row"]) for r in results}
@@ -749,28 +767,19 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         output_dir.mkdir(parents=True, exist_ok=True)
         safe_period = re.sub(r'[<>:"/\\|?*\s]', "_", period.label)
         base_name = f"{input_path.stem}_核对结果_{safe_period}"
-        suffix = 1
-        while True:
-            reserved_path = output_dir / f"{base_name}{'' if suffix == 1 else '_' + str(suffix)}.xlsx"
-            try:
-                # Exclusive creation protects existing reports, including concurrent runs.
-                with reserved_path.open("xb"):
-                    pass
-                break
-            except FileExistsError:
-                suffix += 1
+        reserved_path, reserved_log_path = _reserve_output_pair(output_dir, base_name)
         with tempfile.NamedTemporaryFile(dir=output_dir, prefix=".核对中_", suffix=".xlsx", delete=False) as handle:
             temporary_path = Path(handle.name)
-        notify("正在原表右侧写入结果、标红并启用筛选…")
+        with tempfile.NamedTemporaryFile(dir=output_dir, prefix=".核对中_", suffix=".log", delete=False) as handle:
+            temporary_log_path = Path(handle.name)
+        notify("正在保留原表字段，仅给加油明细原行标红并启用底色筛选…")
         _export(wb, configurations, results, temporary_path, red_only, sources["invoice"])
         _preserve_cell_values(input_path, temporary_path)
-        notify("正在回读检查原始字段、完整发票号码、记录覆盖与红底…")
+        notify("正在回读检查原始字段、发票原格式及加油行红底…")
         _verify_saved(temporary_path, configurations, results, sources["invoice"])
-        _replace_file(temporary_path, reserved_path)
-        temporary_path = None
-        output_path, reserved_path = str(reserved_path), None
         counts = dict(Counter(r["status"] for r in fuel_results))
-        report = dict(output_path=output_path, total_fuel=len(fuel), total_invoice=len(invoices), paired=paired,
+        report = dict(output_path=str(reserved_path), log_path=str(reserved_log_path),
+                      total_fuel=len(fuel), total_invoice=len(invoices), paired=paired,
                       matched=sum(r["status"].startswith("已匹配") for r in fuel_results),
                       red_fuel=sum(r["red"] for r in fuel_results),
                       red_invoice=sum(r["red"] for r in invoice_results), status_counts=counts,
@@ -779,6 +788,15 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
                       actual_total=_plain(sum((r.amount for r in invoices if r.in_scope and r.amount is not None), Decimal(0))),
                       date=period.label, period_start=_format_time(period.start), period_end=_format_time(period.end),
                       amount_tolerance=_plain(amount_limit), minutes_tolerance=_plain(minutes_limit))
+        notify("正在保存完整核对日志（不写入原表）…")
+        _write_log(temporary_log_path, input_path, report)
+        saved_log = temporary_log_path.read_text(encoding="utf-8")
+        if any(f"[{r['source']}!A{r['row']}]" not in saved_log for r in results):
+            raise RuntimeError("核对日志记录覆盖校验失败")
+        _replace_file(temporary_path, reserved_path)
+        temporary_path = None
+        _replace_file(temporary_log_path, reserved_log_path)
+        temporary_log_path = reserved_path = reserved_log_path = None
         notify(f"完成：对应{paired}对，成功匹配{report['matched']}对，加油红底{report['red_fuel']}笔。")
         return report
     except PermissionError as exc:
@@ -786,6 +804,6 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
     finally:
         values_wb.close()
         wb.close()
-        for path in (temporary_path, reserved_path):
+        for path in (temporary_path, reserved_path, temporary_log_path, reserved_log_path):
             if path is not None:
                 path.unlink(missing_ok=True)

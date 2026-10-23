@@ -9,17 +9,22 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from copy import copy
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 from xml.etree import ElementTree
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
+from openpyxl.styles import PatternFill
 from openpyxl.utils import range_boundaries
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from reconciliation import run_reconciliation  # noqa: E402
+import reconciliation  # noqa: E402
 
 
 FUEL_HEADERS = [
@@ -97,6 +102,10 @@ class ReconciliationContractTests(unittest.TestCase):
         summary = run_reconciliation(self.input_path, self.output_directory, **options)
         self.assertTrue(Path(summary["output_path"]).is_file())
         self.assertEqual(Path(summary["output_path"]).parent.resolve(), self.output_directory.resolve())
+        log_path = Path(summary["log_path"])
+        self.assertEqual(log_path, Path(summary["output_path"]).with_suffix(".log"))
+        self.assertTrue(log_path.is_file())
+        log_path.read_text(encoding="utf-8")
         return summary
 
     @staticmethod
@@ -184,19 +193,18 @@ class ReconciliationContractTests(unittest.TestCase):
                 self.assertEqual(abs(self.decimal(result["time_diff"])), 5)
                 self.assertIn("开票时间", result["basis"])
 
-    def test_invoice_last_column_contains_remark_completion_time_as_excel_datetime(self):
+    def test_remark_completion_time_is_retained_without_an_extra_invoice_column(self):
         self.make_workbook(invoices=[invoice(开票时间="2026-10-11 15:00:00")])
         summary = self.run_case()
         workbook = load_workbook(summary["output_path"])
         self.addCleanup(workbook.close)
         sheet = workbook["发票"]
-        self.assertEqual(sheet.cell(2, sheet.max_column).value, "加油完成时间")
-        cell = sheet.cell(3, sheet.max_column)
-        self.assertEqual(cell.value, datetime(2026, 10, 11, 10))
-        self.assertIsInstance(cell.value, datetime)
-        self.assertEqual(cell.number_format, "yyyy-mm-dd hh:mm:ss")
-        self.assertNotIn("加油完成时间", [cell.value for cell in workbook["加油明细记录"][4]])
-        self.assertNotIn("加油完成时间", [cell.value for row in workbook["Sheet1"] for cell in row])
+        self.assertEqual(sheet.max_column, len(INVOICE_HEADERS))
+        self.assertEqual([cell.value for cell in sheet[2]], INVOICE_HEADERS)
+        self.assertEqual(workbook["加油明细记录"].max_column, len(FUEL_HEADERS))
+        self.assertEqual(sheet["J3"].value, invoice()["备注"])
+        for result in summary["results"]:
+            self.assertEqual(result["fuel_end_time"], "2026-10-11 10:00:00")
         self.assertEqual(self.one_fuel_result(summary)["status"], "已匹配")
 
     def test_completion_time_stays_blank_when_matching_falls_back_to_invoice_time(self):
@@ -207,8 +215,9 @@ class ReconciliationContractTests(unittest.TestCase):
                 workbook = load_workbook(summary["output_path"])
                 try:
                     sheet = workbook["发票"]
-                    self.assertEqual(sheet.cell(2, sheet.max_column).value, "加油完成时间")
-                    self.assertIsNone(sheet.cell(3, sheet.max_column).value)
+                    self.assertEqual(sheet.max_column, len(INVOICE_HEADERS))
+                    self.assertEqual([cell.value for cell in sheet[2]], INVOICE_HEADERS)
+                    self.assertTrue(all(result["fuel_end_time"] is None for result in summary["results"]))
                 finally:
                     workbook.close()
                 self.assertEqual(self.one_fuel_result(summary)["status"], "已匹配")
@@ -223,10 +232,12 @@ class ReconciliationContractTests(unittest.TestCase):
         workbook = load_workbook(summary["output_path"])
         self.addCleanup(workbook.close)
         sheet = workbook["发票"]
-        self.assertEqual(sheet.cell(2, sheet.max_column).value, "加油完成时间")
-        for row, stamp in [(3, datetime(2026, 10, 11, 10, 7)), (4, datetime(2026, 10, 12, 11, 8, 9))]:
-            self.assertEqual(sheet.cell(row, sheet.max_column).value, stamp)
-            self.assert_red_row(sheet, row)
+        self.assertEqual(sheet.max_column, len(INVOICE_HEADERS))
+        invoices = [result for result in summary["results"] if result["source"] == "发票"]
+        for result, stamp in zip(invoices, ["2026-10-11 10:07:00", "2026-10-12 11:08:09"]):
+            self.assertEqual(result["fuel_end_time"], stamp)
+            self.assertFalse(result["red"])
+            self.assertTrue(all(cell.fill.fill_type is None for cell in sheet[result["row"]]))
 
     def test_same_time_multiple_guns_pair_to_corresponding_gun(self):
         self.make_workbook(
@@ -242,9 +253,9 @@ class ReconciliationContractTests(unittest.TestCase):
         workbook = load_workbook(summary["output_path"])
         self.addCleanup(workbook.close)
         sheet = workbook["发票"]
-        self.assertEqual(sheet.cell(2, sheet.max_column).value, "加油完成时间")
-        self.assertEqual(sheet.cell(3, sheet.max_column).value, datetime(2026, 10, 11, 10))
-        self.assertEqual(sheet.cell(4, sheet.max_column).value, datetime(2026, 10, 11, 10))
+        self.assertEqual(sheet.max_column, len(INVOICE_HEADERS))
+        for result in summary["results"]:
+            self.assertEqual(result["fuel_end_time"], "2026-10-11 10:00:00")
 
     def test_duplicate_candidates_pair_chronologically_and_only_once(self):
         self.make_workbook(
@@ -289,15 +300,20 @@ class ReconciliationContractTests(unittest.TestCase):
         self.assertEqual(self.one_fuel_result(summary)["status"], "金额不符")
         self.assertEqual(summary["matched"], 0)
         self.assertEqual(summary["red_fuel"], 1)
-        self.assertEqual(summary["red_invoice"], 1)
+        self.assertEqual(summary["red_invoice"], 0)
         workbook = load_workbook(summary["output_path"])
         self.addCleanup(workbook.close)
-        for sheet, header, row in [(workbook.worksheets[0], 4, 5), (workbook.worksheets[1], 2, 3)]:
-            self.assert_red_row(sheet, row)
-            self.assertTrue(sheet.auto_filter.ref)
-            self.assertEqual(sheet.auto_filter.ref.split(":")[0], f"A{header}")
-            self.assertEqual(range_boundaries(sheet.auto_filter.ref)[2], sheet.max_column)
-            self.assertIn("核对状态", [cell.value for cell in sheet[header]])
+        sheet = workbook.worksheets[0]
+        self.assert_red_row(sheet, 5)
+        self.assertEqual(sheet.max_column, len(FUEL_HEADERS))
+        self.assertTrue(sheet.auto_filter.ref)
+        self.assertEqual(range_boundaries(sheet.auto_filter.ref), (1, 4, len(FUEL_HEADERS), 5))
+        self.assertEqual([cell.value for cell in sheet[4]], FUEL_HEADERS)
+        self.assertFalse(workbook.worksheets[1].auto_filter.ref)
+        self.assertTrue(all(cell.fill.fill_type is None for cell in workbook.worksheets[1][3]))
+        log = Path(summary["log_path"]).read_text(encoding="utf-8")
+        for expected in ("金额不符", "金额差", "99.99", "-0.01", "加油明细记录", "发票"):
+            self.assertIn(expected, log)
 
     def test_single_mismatch_and_multiple_mismatch_statuses(self):
         scenarios = [
@@ -338,7 +354,7 @@ class ReconciliationContractTests(unittest.TestCase):
                 invalid = next(result for result in summary["results"] if result["source"] == invalid_source)
                 self.assertEqual(invalid["status"], "待确认")
                 self.assertIsNone(invalid["amount_diff"])
-                self.assertTrue(invalid["red"])
+                self.assertEqual(invalid["red"], invalid_source == "加油明细记录")
                 self.assertEqual(summary["matched"], 0)
 
     def test_missing_counterparts_receive_results_on_both_sides(self):
@@ -351,7 +367,7 @@ class ReconciliationContractTests(unittest.TestCase):
         self.assertEqual(summary["total_invoice"], 1)
         self.assertEqual(len(summary["results"]), 1)
         self.assertEqual(summary["results"][0]["status"], "无对应记录")
-        self.assertTrue(summary["results"][0]["red"])
+        self.assertFalse(summary["results"][0]["red"])
 
     def test_conflicting_gun_or_oil_cannot_be_automatically_matched(self):
         for changes in [{"备注": "交易时间：2026-10-11 10:00:00 油枪号：9"}, {"商品名称": "*汽油*92#车用汽油"}]:
@@ -375,7 +391,7 @@ class ReconciliationContractTests(unittest.TestCase):
                 self.assertEqual(summary["paired"], 0)
                 invoice_rows = [result for result in summary["results"] if result not in self.fuel_results(summary)]
                 self.assertTrue(all(result["status"] == "待确认" for result in invoice_rows))
-                self.assertTrue(all(result["red"] for result in invoice_rows))
+                self.assertTrue(all(not result["red"] for result in invoice_rows))
                 self.assertTrue(all(not result["counterpart"] for result in invoice_rows))
 
     def test_original_cells_sheet_count_and_full_invoice_number_are_preserved(self):
@@ -390,11 +406,84 @@ class ReconciliationContractTests(unittest.TestCase):
         self.addCleanup(after.close)
         self.assertEqual(after.sheetnames, list(original_values))
         for name, rows in original_values.items():
+            self.assertEqual(after[name].max_column, len(rows[0]))
+            self.assertEqual(after[name].max_row, len(rows))
             for row_index, row in enumerate(rows, start=1):
                 for column, value in enumerate(row, start=1):
                     self.assertEqual(after[name].cell(row_index, column).value, value, (name, row_index, column))
+                    self.assertIsNone(after[name].cell(row_index, column).comment)
         self.assertEqual(after["发票"]["E3"].value, "26447200000093907128")
         self.assertIsInstance(after["发票"]["E3"].value, str)
+
+    def test_original_comments_dimensions_and_invoice_presentation_are_preserved(self):
+        self.make_workbook(invoices=[invoice(**{"合计金额（含税）": 100.01})])
+        workbook = load_workbook(self.input_path)
+        for sheet, row in [(workbook.worksheets[0], 5), (workbook.worksheets[1], 3)]:
+            sheet.cell(row, 1).comment = Comment("原始人工备注，不要覆盖", "原作者")
+            sheet.cell(row, 4).comment = Comment("另一条原始备注", "复核员")
+            sheet.row_dimensions[row].height = 19.5
+            sheet.row_dimensions[1].height = 28
+            sheet.column_dimensions["A"].width = 18.25
+            sheet.column_dimensions["J"].width = 36.75
+        sheet = workbook["发票"]
+        sheet.auto_filter.ref = "A2:AE3"
+        sheet.auto_filter.add_filter_column(1, ["蓝票"])
+        sheet.freeze_panes = "C3"
+        sheet.sheet_view.zoomScale = 85
+        sheet["G3"].fill = PatternFill("solid", fgColor="FFF2CC")
+        workbook.save(self.input_path)
+        workbook.close()
+        before = load_workbook(self.input_path)
+        self.addCleanup(before.close)
+        summary = self.run_case(red_only=True)
+        after = load_workbook(summary["output_path"])
+        self.addCleanup(after.close)
+        self.assertEqual(after.sheetnames, before.sheetnames)
+        for original, result in zip(before, after):
+            self.assertEqual((result.max_row, result.max_column), (original.max_row, original.max_column))
+            self.assertEqual(list(result.values), list(original.values))
+            self.assertEqual(
+                {key: dict(value) for key, value in result.column_dimensions.items()},
+                {key: dict(value) for key, value in original.column_dimensions.items()},
+            )
+            for row, dimension in original.row_dimensions.items():
+                self.assertEqual(result.row_dimensions[row].height, dimension.height)
+            for row in original:
+                for cell in row:
+                    actual = result[cell.coordinate]
+                    self.assertEqual(actual.comment, cell.comment, cell.coordinate)
+                    if original.title == "发票":
+                        self.assertEqual(copy(actual.fill), copy(cell.fill), cell.coordinate)
+            if original.title == "发票":
+                self.assertEqual(result.auto_filter, original.auto_filter)
+                self.assertEqual(result.freeze_panes, original.freeze_panes)
+                self.assertEqual(result.sheet_view.zoomScale, original.sheet_view.zoomScale)
+                self.assertEqual(
+                    {key: dict(value) for key, value in result.row_dimensions.items()},
+                    {key: dict(value) for key, value in original.row_dimensions.items()},
+                )
+        self.assert_red_row(after["加油明细记录"], 5)
+        self.assertEqual(summary["red_invoice"], 0)
+
+    def test_companion_log_contains_every_record_without_adding_workbook_information(self):
+        self.make_workbook(
+            [fuel(), fuel(交易时间=datetime(2026, 10, 11, 12), 流水号="F002")],
+            [invoice(), invoice(备注="交易时间：2026-10-11 12:00:00 油枪号：4", 数电票号码="26447200000093907129", **{"合计金额（含税）": 100.01})],
+        )
+        summary = self.run_case()
+        log = Path(summary["log_path"]).read_text(encoding="utf-8")
+        self.assertEqual(len(summary["results"]), 4)
+        for result in summary["results"]:
+            for text in (result["source"], str(result["row"]), result["status"], result["counterpart"], result["invoice_number"]):
+                self.assertIn(text, log)
+        for text in ("金额差", "升数差", "时间差", "2026-10-11 10:00:00", "0.01", "100.01"):
+            self.assertIn(text, log)
+        workbook = load_workbook(summary["output_path"])
+        self.addCleanup(workbook.close)
+        self.assertEqual(workbook.sheetnames, ["加油明细记录", "发票", "Sheet1"])
+        self.assertEqual(workbook.worksheets[0].max_column, len(FUEL_HEADERS))
+        self.assertEqual(workbook.worksheets[1].max_column, len(INVOICE_HEADERS))
+        self.assertTrue(all(cell.comment is None for sheet in workbook for row in sheet for cell in row))
 
     def test_totals_and_print_footer_are_not_counted_as_records(self):
         self.make_workbook(footer=True)
@@ -413,6 +502,51 @@ class ReconciliationContractTests(unittest.TestCase):
         second = self.run_case()
         self.assertNotEqual(old_path.resolve(), Path(second["output_path"]).resolve())
         self.assertEqual(old_path.read_bytes(), old_bytes)
+
+    def test_existing_companion_log_is_preserved_and_entire_pair_uses_new_name(self):
+        self.make_workbook()
+        first = self.run_case()
+        first_workbook = Path(first["output_path"])
+        first_log = Path(first["log_path"])
+        original_log = first_log.read_bytes()
+        first_workbook.unlink()
+        second = self.run_case()
+        self.assertNotEqual(Path(second["output_path"]), first_workbook)
+        self.assertNotEqual(Path(second["log_path"]), first_log)
+        self.assertFalse(first_workbook.exists(), "旧日志旁不能留下孤立的工作簿占位文件")
+        self.assertEqual(first_log.read_bytes(), original_log)
+        self.assertEqual(
+            set(self.output_directory.iterdir()),
+            {first_log, Path(second["output_path"]), Path(second["log_path"])},
+        )
+
+    def test_failed_final_log_replace_removes_undelivered_pair_and_temporary_files(self):
+        self.make_workbook()
+        self.output_directory.mkdir()
+        preserved = {}
+        for name in ("已有文件.xlsx", "已有文件.log", "人工备注.txt"):
+            path = self.output_directory / name
+            preserved[path] = ("必须保留：" + name).encode("utf-8")
+            path.write_bytes(preserved[path])
+        original_input = self.input_path.read_bytes()
+        original_replace = reconciliation._replace_file
+        attempted_log_targets = []
+
+        def replace_except_log(source, target):
+            if Path(target).suffix == ".log":
+                attempted_log_targets.append(Path(target))
+                raise PermissionError("模拟日志被永久占用")
+            return original_replace(source, target)
+
+        with patch("reconciliation._replace_file", side_effect=replace_except_log):
+            with self.assertRaises(reconciliation.ReconciliationError) as failure:
+                run_reconciliation(self.input_path, self.output_directory)
+        self.assertIsInstance(failure.exception.__cause__, PermissionError)
+        self.assertEqual(len(attempted_log_targets), 1)
+        self.assertEqual(set(self.output_directory.iterdir()), set(preserved))
+        for path, content in preserved.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.input_path.read_bytes(), original_input)
 
     def test_non_target_date_rows_are_still_annotated_for_review(self):
         self.make_workbook(
@@ -457,22 +591,25 @@ class ReconciliationContractTests(unittest.TestCase):
         self.addCleanup(workbook.close)
         self.assertTrue(workbook.worksheets[0].row_dimensions[5].hidden)
         self.assertFalse(workbook.worksheets[0].row_dimensions[6].hidden)
-        self.assertTrue(workbook.worksheets[1].row_dimensions[3].hidden)
+        self.assertFalse(workbook.worksheets[1].row_dimensions[3].hidden)
         self.assertFalse(workbook.worksheets[1].row_dimensions[4].hidden)
-        for sheet in workbook.worksheets[:2]:
-            self.assertEqual(range_boundaries(sheet.auto_filter.ref)[2], sheet.max_column)
+        self.assertEqual(range_boundaries(workbook.worksheets[0].auto_filter.ref)[2], len(FUEL_HEADERS))
+        self.assertFalse(workbook.worksheets[1].auto_filter.ref)
         with zipfile.ZipFile(summary["output_path"]) as archive:
             styles = ElementTree.fromstring(archive.read("xl/styles.xml"))
             dxfs = styles.find("s:dxfs", NS)
             self.assertIsNotNone(dxfs)
-            for index in (1, 2):
-                document = ElementTree.fromstring(archive.read(f"xl/worksheets/sheet{index}.xml"))
-                color_filter = document.find("s:autoFilter/s:filterColumn/s:colorFilter", NS)
-                self.assertIsNotNone(color_filter)
-                dxf = list(dxfs)[int(color_filter.attrib["dxfId"])]
-                color = dxf.find("s:fill/s:patternFill/s:fgColor", NS)
-                self.assertIsNotNone(color)
-                self.assertEqual(color.attrib["rgb"][-6:].upper(), "FFC7CE")
+            document = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            column = document.find("s:autoFilter/s:filterColumn", NS)
+            self.assertEqual(column.attrib["colId"], "0")
+            color_filter = column.find("s:colorFilter", NS)
+            self.assertIsNotNone(color_filter)
+            dxf = list(dxfs)[int(color_filter.attrib["dxfId"])]
+            color = dxf.find("s:fill/s:patternFill/s:fgColor", NS)
+            self.assertIsNotNone(color)
+            self.assertEqual(color.attrib["rgb"][-6:].upper(), "FFC7CE")
+            invoice_document = ElementTree.fromstring(archive.read("xl/worksheets/sheet2.xml"))
+            self.assertIsNone(invoice_document.find("s:autoFilter", NS))
 
 
 if __name__ == "__main__":
