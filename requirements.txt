@@ -1,0 +1,4 @@
+# 运行打包后的 EXE 无需安装 Python；以下为源码运行和开发构建依赖。
+openpyxl>=3.1.5,<4
+pyinstaller>=6.15,<7
+Pillow>=11.3,<12

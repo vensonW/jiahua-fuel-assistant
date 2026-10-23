@@ -1,0 +1,20 @@
+__pycache__/
+build/
+outputs/
+*.pyc
+_runtime/
+
+# Build artifacts and local environments
+dist/
+/*.exe
+.venv/
+venv/
+
+# Local business workbooks and temporary Excel files
+/*.xlsx
+~$*
+
+# Local credentials
+.env
+.env.*
+!.env.example
