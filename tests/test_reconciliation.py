@@ -272,6 +272,27 @@ class ReconciliationContractTests(unittest.TestCase):
         with self.assertRaisesRegex(reconciliation.ReconciliationError, "临时锁定文件"):
             self.run_case(invoice_audit_path=locked)
 
+    def test_invoice_audit_ignores_incorrect_worksheet_dimensions(self):
+        audit_path = self.directory / "发票审核单.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        for column, label in enumerate(("红票标志", "数电票号码", "开票时间", "备注"), 1):
+            sheet.cell(6, column, label)
+        sheet.append(["红票", "26447200000089100671", "2026-10-07 18:09:16",
+                      "被红冲蓝字数电发票号码：26447200000089100664"])
+        workbook.save(audit_path)
+        workbook.close()
+        damaged_path = self.directory / "尺寸标注错误.xlsx"
+        with zipfile.ZipFile(audit_path) as original, zipfile.ZipFile(damaged_path, "w") as damaged:
+            for item in original.infolist():
+                content = original.read(item.filename)
+                if item.filename == "xl/worksheets/sheet1.xml":
+                    content = re.sub(rb'<dimension ref="[^"]+"', b'<dimension ref="A1"', content, count=1)
+                damaged.writestr(item, content)
+        invalid_numbers = reconciliation.scan_voided_invoice_numbers(damaged_path)
+        self.assertIn("26447200000089100664", invalid_numbers)
+        self.assertIn("26447200000089100671", invalid_numbers)
+
     def test_invoice_period_can_be_above_header_in_fifth_row(self):
         self.make_workbook(
             fuels=[fuel(交易时间=datetime(2026, 10, 1, 10))],

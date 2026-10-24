@@ -206,7 +206,7 @@ def _header_key(value) -> str:
 
 
 def _find_header(ws, aliases, required):
-    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 40)):
+    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row or 40, 40)):
         keys = {_header_key(cell.value): cell.column for cell in row if cell.value is not None}
         mapping = {}
         for name, choices in aliases.items():
@@ -316,6 +316,7 @@ def scan_voided_invoice_numbers(input_path):
     try:
         candidates = []
         for ws in workbook.worksheets:
+            ws.reset_dimensions()
             found = _find_header(ws, INVOICE_ALIASES, ["time", "remark"])
             if found and ("electronic" in found[1] or "number" in found[1]):
                 candidates.append((ws, *found))
