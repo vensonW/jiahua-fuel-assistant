@@ -960,6 +960,7 @@ class ReconciliationContractTests(unittest.TestCase):
         self.make_workbook()
         first = self.run_case()
         old_path = Path(first["output_path"])
+        self.assertRegex(old_path.name, r"^原始数据_核对结果_\d{12}\.xlsx$")
         old_bytes = old_path.read_bytes()
         second = self.run_case()
         self.assertNotEqual(old_path.resolve(), Path(second["output_path"]).resolve())

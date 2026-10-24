@@ -1271,8 +1271,7 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         if len(counterparts) != len(set(counterparts)):
             raise RuntimeError("发票重复使用校验失败")
         output_dir.mkdir(parents=True, exist_ok=True)
-        safe_period = re.sub(r'[<>:"/\\|?*\s]', "_", period.label)
-        base_name = f"{input_path.stem}_核对结果_{safe_period}"
+        base_name = f"{input_path.stem}_核对结果_{datetime.now():%Y%m%d%H%M}"
         reserved_path, reserved_log_path = _reserve_output_pair(output_dir, base_name)
         with tempfile.NamedTemporaryFile(dir=output_dir, prefix=".核对中_", suffix=".xlsx", delete=False) as handle:
             temporary_path = Path(handle.name)
