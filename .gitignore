@@ -1,5 +1,6 @@
 __pycache__/
 build/
+/build-exe.log
 outputs/
 *.pyc
 _runtime/

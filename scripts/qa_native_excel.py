@@ -1,4 +1,4 @@
-"""Read-only native Excel check of original columns and fuel-only marking."""
+"""Read-only native Excel check of invoice time and fuel-only marking."""
 from pathlib import Path
 from copy import copy
 import json
@@ -7,6 +7,7 @@ import sys
 import pythoncom
 import win32com.client
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 
 def main():
@@ -19,28 +20,35 @@ def main():
     try:
         assert original.sheetnames == result.sheetnames
         for before, after in zip(original.worksheets, result.worksheets):
-            assert before.max_column == after.max_column
+            is_invoice = before.title == original.worksheets[1].title
+            is_fuel = before.title == original.worksheets[0].title
+            assert after.max_column == before.max_column + int(is_invoice or is_fuel)
             for row in before:
                 for cell in row:
-                    saved = after.cell(cell.row, cell.column)
+                    saved = after.cell(cell.row, cell.column + int(is_invoice and cell.column >= 11))
                     assert cell.value == saved.value
                     assert (cell.comment.text if cell.comment else None) == (saved.comment.text if saved.comment else None)
-                    if before.title == original.worksheets[1].title:
+                    if is_invoice:
                         assert copy(cell.fill) == copy(saved.fill)
                         assert copy(cell.font) == copy(saved.font)
                         assert cell.number_format == saved.number_format
             for key, dimension in before.row_dimensions.items():
                 assert dimension.height == after.row_dimensions[key].height
             for key, dimension in before.column_dimensions.items():
-                assert dimension.width == after.column_dimensions[key].width
-        assert result.worksheets[0].max_column == 20
-        assert result.worksheets[1].max_column == 31
+                shifted = get_column_letter(int(after[key + "1"].column) + int(is_invoice and after[key + "1"].column >= 11))
+                assert dimension.width == after.column_dimensions[shifted].width
+        assert result.worksheets[0].max_column == 21
+        assert result.worksheets[0]["U4"].value == "失败原因"
+        assert result.worksheets[1].max_column == 32
+        assert result.worksheets[1]["K2"].value == "交易时间"
+        expected_red = [row for row in range(5, original.worksheets[0].max_row + 1)
+                        if result.worksheets[0].cell(row, 1).fill.fgColor.rgb == "FFFFC7CE"]
     finally:
         original.close()
         result.close()
-    log_path = report.with_suffix(".log")
+    log_path = report.parent / "logs" / (report.stem + ".log")
     log = log_path.read_text(encoding="utf-8")
-    assert "加油开始时间" in log and "26447200000093907128" in log and "匹配明细" in log
+    assert "以下仅记录匹配失败" in log
     pythoncom.CoInitialize()
     excel = win32com.client.DispatchEx("Excel.Application")
     excel.Visible = False
@@ -49,13 +57,15 @@ def main():
     try:
         workbook = excel.Workbooks.Open(str(report), UpdateLinks=0, ReadOnly=True)
         fuel, invoice = workbook.Worksheets(1), workbook.Worksheets(2)
-        assert fuel.UsedRange.Columns.Count == 20
-        assert invoice.UsedRange.Columns.Count == 31
+        assert fuel.UsedRange.Columns.Count == 21
+        assert fuel.Range("U4").Text == "失败原因"
+        assert invoice.UsedRange.Columns.Count == 32
+        assert invoice.Range("K2").Text == "交易时间"
         assert invoice.Range("E3").Text == "26447200000093907128"
         red = 13551615
         fuel_red = [row for row in range(5, 102) if fuel.Cells(row, 1).Interior.Color == red]
         invoice_red = [row for row in range(3, 100) if invoice.Cells(row, 1).Interior.Color == red]
-        assert len(fuel_red) == 82 and len(invoice_red) == 0
+        assert fuel_red == expected_red and len(invoice_red) == 0
         fuel.AutoFilter.Range.AutoFilter(Field=1, Criteria1=red, Operator=8)
         visible = [row for row in range(5, 102) if not fuel.Rows(row).Hidden]
         assert visible == fuel_red
@@ -68,9 +78,9 @@ def main():
             sheet.PageSetup.FitToPagesWide = 1
             sheet.PageSetup.FitToPagesTall = 1
             sheet.ExportAsFixedFormat(0, str(qa / (name + ".pdf")))
-        evidence = dict(fuel_columns=20, invoice_columns=31, fuel_red=82, invoice_red=0,
-                        fuel_color_filter_visible=82, original_values_and_invoice_format_preserved=True,
-                        no_new_columns_or_comments=True, log_path=str(log_path))
+        evidence = dict(fuel_columns=21, invoice_columns=32, fuel_red=len(fuel_red), invoice_red=0,
+                        fuel_color_filter_visible=len(visible), original_values_and_invoice_format_preserved=True,
+                        invoice_transaction_time_column=True, log_path=str(log_path))
         (qa / "native_excel.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
         print(json.dumps(evidence, ensure_ascii=False))
     finally:

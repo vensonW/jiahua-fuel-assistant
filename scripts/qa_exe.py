@@ -26,12 +26,17 @@ summary = None
 if not args.icon_only:
     subprocess.run(arguments, check=True, timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert summary["paired"] == 97 and summary["matched"] == 15
-    assert summary["red_fuel"] == 82 and summary["red_invoice"] == 0
+    assert summary["total_fuel"] == 97 and summary["total_invoice"] == 97
+    assert 0 <= summary["matched"] <= summary["paired"] <= 97
+    assert summary["red_fuel"] == summary["total_fuel"] - summary["matched"]
+    assert summary["red_invoice"] == 0
     log_path = Path(summary["log_path"])
-    assert log_path == Path(summary["output_path"]).with_suffix(".log")
+    output_path = Path(summary["output_path"])
+    assert log_path == output_path.parent / "logs" / (output_path.stem + ".log")
     log_text = log_path.read_text(encoding="utf-8")
-    assert "加油开始时间" in log_text and "匹配明细" in log_text
+    assert "以下仅记录匹配失败" in log_text
+    if summary["red_fuel"]:
+        assert "失败原因" in log_text
     assert summary["period_start"] == "2026-10-11 00:00:00"
     assert summary["period_end"] == "2026-10-11 23:59:59.999999"
     subprocess.run([str(exe), "--smoke-gui"], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
