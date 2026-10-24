@@ -228,6 +228,18 @@ class ReconciliationContractTests(unittest.TestCase):
         self.assertEqual(success.max_row, 3)
         self.assertEqual(success["A3"].value, stations[0])
 
+    def test_headers_are_found_after_variable_length_intro_rows(self):
+        self.make_workbook()
+        workbook = load_workbook(self.input_path)
+        workbook["加油明细记录"].insert_rows(4, 55)
+        workbook["发票"].insert_rows(2, 55)
+        workbook.save(self.input_path)
+        workbook.close()
+        self.assertEqual(reconciliation.scan_workbook_metadata(self.input_path)[2],
+                         ("2026-10-11", "2026-10-11"))
+        summary = self.run_case()
+        self.assertEqual((summary["total_fuel"], summary["total_invoice"], summary["matched"]), (1, 1, 1))
+
     def test_reversed_invoice_is_excluded_before_pairing_and_export(self):
         invalid_number = "26447200000089100664"
         valid_number = "26447200000089100670"
@@ -277,7 +289,7 @@ class ReconciliationContractTests(unittest.TestCase):
         workbook = Workbook()
         sheet = workbook.active
         for column, label in enumerate(("红票标志", "数电票号码", "开票时间", "备注"), 1):
-            sheet.cell(6, column, label)
+            sheet.cell(66, column, label)
         sheet.append(["红票", "26447200000089100671", "2026-10-07 18:09:16",
                       "被红冲蓝字数电发票号码：26447200000089100664"])
         workbook.save(audit_path)

@@ -205,17 +205,22 @@ def _header_key(value) -> str:
     return re.sub(r"[\s（）()\-—_]", "", str(value or ""))
 
 
-def _find_header(ws, aliases, required):
-    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row or 40, 40)):
-        keys = {_header_key(cell.value): cell.column for cell in row if cell.value is not None}
-        mapping = {}
-        for name, choices in aliases.items():
-            for choice in choices:
-                if _header_key(choice) in keys:
-                    mapping[name] = keys[_header_key(choice)]
-                    break
-        if set(required) <= mapping.keys():
-            return row[0].row, mapping
+def _find_header(ws, options):
+    normalized = [(kind, {name: tuple(_header_key(choice) for choice in choices)
+                          for name, choices in aliases.items()}, set(required))
+                  for kind, aliases, required in options]
+    for row_number, row in enumerate(ws.iter_rows(values_only=True), 1):
+        keys = {_header_key(value): column for column, value in enumerate(row, 1)
+                if isinstance(value, str)}
+        for kind, aliases, required in normalized:
+            mapping = {}
+            for name, choices in aliases.items():
+                for choice in choices:
+                    if choice in keys:
+                        mapping[name] = keys[choice]
+                        break
+            if required <= mapping.keys():
+                return kind, row_number, mapping
     return None
 
 
@@ -226,15 +231,17 @@ def _invoice_station(remark, fallback=""):
 
 def _locate_sheets(workbook):
     candidates = defaultdict(list)
+    options = (
+        ("fuel", FUEL_ALIASES, ["gun", "time", "oil", "volume", "trade"]),
+        ("invoice", INVOICE_ALIASES, ["time", "amount", "remark", "oil", "volume"]),
+    )
     for ws in workbook.worksheets:
-        for kind, aliases, required in (
-            ("fuel", FUEL_ALIASES, ["gun", "time", "oil", "volume", "trade"]),
-            ("invoice", INVOICE_ALIASES, ["time", "amount", "remark", "oil", "volume"]),
-        ):
-            header = _find_header(ws, aliases, required)
-            if header:
-                candidates[kind].append((ws, *header))
-                break
+        if hasattr(ws, "reset_dimensions"):
+            ws.reset_dimensions()
+        found = _find_header(ws, options)
+        if found:
+            kind, header, mapping = found
+            candidates[kind].append((ws, header, mapping))
     if set(candidates) != {"fuel", "invoice"}:
         raise ReconciliationError("未找到加油明细或发票工作表，请检查交易金额、加油量、交易时间、枪号及发票备注等表头")
     found = {}
@@ -317,9 +324,9 @@ def scan_voided_invoice_numbers(input_path):
         candidates = []
         for ws in workbook.worksheets:
             ws.reset_dimensions()
-            found = _find_header(ws, INVOICE_ALIASES, ["time", "remark"])
-            if found and ("electronic" in found[1] or "number" in found[1]):
-                candidates.append((ws, *found))
+            found = _find_header(ws, (("invoice", INVOICE_ALIASES, ["time", "remark"]),))
+            if found and ("electronic" in found[2] or "number" in found[2]):
+                candidates.append((ws, found[1], found[2]))
         if len(candidates) != 1:
             raise ReconciliationError("发票审核单中未找到唯一的发票切页，请检查开票时间、发票号码和备注表头")
         ws, header, mapping = candidates[0]
