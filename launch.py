@@ -75,7 +75,6 @@ def main(argv: list[str] | None = None) -> int:
             date_text=args.date if args.date is not None else ("" if period_requested else "2026-10-11"),
             start_text=args.start,
             end_text=args.end,
-            minutes_tolerance="60",
             red_only=args.red_only,
             worker_count=args.workers,
             progress=lambda message: _write_progress(str(message)),

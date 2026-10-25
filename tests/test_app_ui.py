@@ -44,8 +44,9 @@ class AppUiTests(unittest.TestCase):
         self.assertNotIn("Button.focus", str(ttk.Style(self.root).layout("TButton")))
         self.assertTrue(all(isinstance(control, ttk.Button) for control in self.app.setting_controls[6:9]))
         self.assertEqual(self.app.worker_count.get(), "20")
-        self.assertEqual(self.app.minutes_tolerance.get(), "60")
-        self.assertIsInstance(self.app.minutes_entry, ttk.Entry)
+        self.assertEqual(self.app.open_button["text"], "打开已标注原文件")
+        self.assertFalse(hasattr(self.app, "minutes_entry"))
+        self.assertIn("早于开始时间不超过 10 分钟", self.app.rules_text.get())
         self.assertEqual(str(self.app.worker_combo["state"]), "readonly")
         self.assertEqual(self.app.result_table.heading("fuel_start_time")["text"], "加油明细切页-交易时间")
         self.assertEqual(self.app.result_table.heading("fuel_end_time")["text"], "发票-交易时间")
@@ -53,20 +54,16 @@ class AppUiTests(unittest.TestCase):
         unchecked, checked = self.app.checkbox_images
         self.assertNotEqual(unchecked.get(8, 12), checked.get(8, 12))
 
-    def test_time_interval_is_passed_to_reconciliation(self):
+    def test_run_has_no_time_interval_setting(self):
         self.app.input_path.set("sample.xlsx")
         self.app.station_path = "sample.xlsx"
-        self.app.minutes_tolerance.set("15")
-        self.assertIn("0—15 分钟", self.app.rules_text.get())
         with patch.object(Path, "is_file", return_value=True), patch("app.threading.Thread") as thread:
             self.app._start_run()
-        self.assertEqual(thread.call_args.kwargs["args"][0]["minutes_tolerance"], "15")
+        self.assertNotIn("minutes_tolerance", thread.call_args.kwargs["args"][0])
         self.assertEqual(thread.call_args.kwargs["args"][0]["invoice_audit_path"], str(self.audit_path))
         self.assertEqual(str(self.app.progress["mode"]), "indeterminate")
-        self.assertEqual(str(self.app.minutes_entry["state"]), "disabled")
         self.app.progress.stop()
         self.app._finish_run()
-        self.assertEqual(str(self.app.minutes_entry["state"]), "normal")
 
     def test_date_buttons_are_disabled_until_fuel_dates_are_loaded(self):
         controls = (*self.app.time_buttons, self.app.all_time_button)
@@ -150,17 +147,6 @@ class AppUiTests(unittest.TestCase):
         self.assertEqual(load_last_input_path(), str(workbook))
         self.app._finish_run()
 
-    def test_invalid_time_interval_does_not_start(self):
-        self.app.input_path.set("sample.xlsx")
-        self.app.station_path = "sample.xlsx"
-        for interval in ("", "abc", "-1", "525601"):
-            with self.subTest(interval=interval):
-                self.app.minutes_tolerance.set(interval)
-                with patch.object(Path, "is_file", return_value=True), patch("app.threading.Thread") as thread, patch("app.messagebox.showerror") as error:
-                    self.app._start_run()
-                thread.assert_not_called()
-                self.assertIn("筛选时间间隔", error.call_args.args[1])
-
     def test_calendar_selects_date_and_optional_time(self):
         anchor = self.app.setting_controls[6]
         picker = DateTimePicker(self.root, self.app.start_text, "开始时间", anchor)
@@ -180,22 +166,17 @@ class AppUiTests(unittest.TestCase):
         self.app._clear_period()
         self.assertEqual((self.app.start_text.get(), self.app.end_text.get()), ("", ""))
 
-    def test_calendar_disables_days_outside_fuel_date_range(self):
+    def test_calendar_allows_days_outside_fuel_date_range(self):
         variable = tk.StringVar(value="2026-10-03")
-        picker = DateTimePicker(self.root, variable, "开始时间", self.app.setting_controls[6],
-                                date(2026, 10, 3), date(2026, 10, 5))
-        self.assertEqual(picker.month_combo["values"], ("10",))
-        disabled = [button for button in picker.calendar.winfo_children()
-                    if isinstance(button, ttk.Button) and button["text"] == "2"]
-        self.assertEqual(len(disabled), 1)
-        self.assertEqual(str(disabled[0]["state"]), "disabled")
+        self.app.fuel_date_range = ("2026-10-03", "2026-10-05")
+        picker = DateTimePicker(self.root, variable, "开始时间", self.app.setting_controls[6])
+        self.assertEqual(picker.month_combo["values"], tuple(f"{month:02d}" for month in range(1, 13)))
         picker._select_day(2)
-        self.assertEqual(picker.selected_date, date(2026, 10, 3))
+        self.assertEqual(picker.selected_date, date(2026, 10, 2))
         picker._shift_month(-1)
-        self.assertEqual(picker.month.get(), "10")
-        picker._select_day(4)
+        self.assertEqual(picker.month.get(), "09")
         picker._apply()
-        self.assertEqual(variable.get(), "2026-10-04")
+        self.assertEqual(variable.get(), "2026-09-02")
 
     def test_status_filter_lists_only_present_failures(self):
         self.assertEqual(self.app.status_combo["values"], ("全部状态",))
@@ -230,11 +211,15 @@ class AppUiTests(unittest.TestCase):
     def test_completion_summary_shows_elapsed_time(self):
         self.app.events.put(("done", {
             "output_path": "result.xlsx", "log_path": "result.log", "results": [],
+            "annotated_input_path": "input.xlsx", "input_backup_path": "input_backup.xlsx", "red_invoice": 0,
             "total_fuel": 97, "total_invoice": 97, "paired": 90,
             "matched": 85, "red_fuel": 12, "elapsed_text": "2分34.56秒",
         }))
         self.app._poll_events()
         self.assertIn("核对耗时：2分34.56秒", self.app.summary_text.get())
+        with patch.object(self.app, "_open_path") as opened, patch.object(Path, "is_file", return_value=True):
+            self.app._open_result()
+        opened.assert_called_once_with(Path("input.xlsx"))
 
     def test_row_search_refresh_is_debounced(self):
         self.app.row_search.set("1698")
@@ -265,18 +250,21 @@ class AppUiTests(unittest.TestCase):
         self.assertTrue(all(variable.get() for variable in self.app.station_vars.values()))
         self.assertTrue(all(widget.instate(("selected",)) for widget in self.app.station_items.winfo_children()))
 
-    def test_disjoint_selected_time_is_rejected_before_loading_workbook(self):
+    def test_disjoint_selected_time_can_start_reconciliation(self):
         self.app.input_path.set("sample.xlsx")
         self.app.station_path = "sample.xlsx"
+        self.app.fuel_date_range = ("2026-10-01", "2026-10-07")
         self.app.invoice_interval = ("2026-10-01", "2026-10-07")
         self.app.start_text.set("2026-10-11")
         self.app.end_text.set("2026-10-11")
         with patch.object(Path, "is_file", return_value=True), patch("app.threading.Thread") as thread, patch("app.messagebox.showerror") as error:
             self.app._start_run()
-        thread.assert_not_called()
-        self.assertIn("不重叠", error.call_args.args[1])
+        thread.assert_called_once()
+        error.assert_not_called()
+        self.assertEqual(thread.call_args.kwargs["args"][0]["start_text"], "2026-10-11")
+        self.app._finish_run()
 
-    def test_out_of_fuel_date_range_is_rejected(self):
+    def test_out_of_fuel_date_range_can_start_reconciliation(self):
         self.app.input_path.set("sample.xlsx")
         self.app.station_path = "sample.xlsx"
         self.app.fuel_date_range = ("2026-10-02", "2026-10-06")
@@ -284,8 +272,10 @@ class AppUiTests(unittest.TestCase):
         self.app.end_text.set("2026-10-06")
         with patch.object(Path, "is_file", return_value=True), patch("app.threading.Thread") as thread, patch("app.messagebox.showerror") as error:
             self.app._start_run()
-        thread.assert_not_called()
-        self.assertIn("加油明细日期范围", error.call_args.args[1])
+        thread.assert_called_once()
+        error.assert_not_called()
+        self.assertEqual(thread.call_args.kwargs["args"][0]["start_text"], "2026-10-01")
+        self.app._finish_run()
 
 
 if __name__ == "__main__":

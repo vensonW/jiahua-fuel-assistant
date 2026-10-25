@@ -69,7 +69,7 @@ class LatestPlanTests(unittest.TestCase):
 
     def assert_only_fuel_rows_are_red(self, summary):
         self.assertTrue(all(row["red"] for row in self.fuel_rows(summary)))
-        self.assertTrue(all(not row["red"] for row in self.invoice_rows(summary)))
+        self.assertTrue(all(row["red"] == (not row["counterpart"]) for row in self.invoice_rows(summary)))
 
     def assert_red_row(self, sheet, row):
         fixtures.ReconciliationContractTests.assert_red_row(self, sheet, row)
@@ -198,7 +198,7 @@ class LatestPlanTests(unittest.TestCase):
         self.assertEqual(summary["matched"], 0)
         result = self.invoice_rows(summary)[0]
         self.assertEqual(result["status"], "待确认")
-        self.assertFalse(result["red"])
+        self.assertTrue(result["red"])
         workbook = self.open_result(summary)
         self.assert_original_columns(workbook)
         self.assertIsNone(result["fuel_end_time"])
@@ -213,17 +213,18 @@ class LatestPlanTests(unittest.TestCase):
         self.assertFalse(result["red"])
         self.assertEqual(summary["matched"], 1)
 
-    def test_signed_start_to_end_time_zero_thirty_and_negative_second(self):
+    def test_signed_start_to_end_time_without_upper_limit_and_ten_minute_grace(self):
         cases = [
             ("10:00:00", "已匹配", Decimal("0")),
             ("10:30:00", "已匹配", Decimal("30")),
-            ("10:30:01", "时间超限", Decimal("30.016667")),
-            ("09:59:59", "时间先后异常", Decimal("-0.016667")),
+            ("10:30:01", "已匹配", Decimal("30.016667")),
+            ("09:59:59", "已匹配", Decimal("-0.016667")),
+            ("09:49:59", "时间先后异常", Decimal("-10.016667")),
         ]
         for stamp, status, difference in cases:
             with self.subTest(stamp=stamp):
                 self.make_workbook(invoices=[fixtures.invoice(备注=f"交易时间：2026-10-11 {stamp} 油枪号：4")])
-                summary = self.run_case(minutes_tolerance="30")
+                summary = self.run_case()
                 result = self.first_fuel(summary)
                 self.assertTrue(result["counterpart"])
                 self.assertEqual(result["status"], status)
@@ -231,14 +232,14 @@ class LatestPlanTests(unittest.TestCase):
                 self.assertEqual(result["red"], status != "已匹配")
                 if status == "时间先后异常":
                     self.assertNotIn("时间先后异常", result["failure_reason"])
-                    self.assertIn("早1秒", result["failure_reason"])
+                    self.assertIn("早10分钟1秒", result["failure_reason"])
                 if status != "已匹配":
                     workbook = self.open_result(summary)
                     self.assert_red_row(workbook.worksheets[0], 5)
                     self.assertTrue(all(cell.fill.fill_type is None for cell in workbook.worksheets[1][3]))
 
     def test_amount_difference_has_priority_over_reversed_time(self):
-        self.make_workbook(invoices=[fixtures.invoice(备注="交易时间：2026-10-11 09:59:59 油枪号：4", **{"合计金额（含税）": 100.01})])
+        self.make_workbook(invoices=[fixtures.invoice(备注="交易时间：2026-10-11 09:49:59 油枪号：4", **{"合计金额（含税）": 100.01})])
         summary = self.run_case()
         result = self.first_fuel(summary)
         self.assertTrue(result["counterpart"])
@@ -249,10 +250,10 @@ class LatestPlanTests(unittest.TestCase):
         self.assertIn("金额不符", result["failure_reason"])
         self.assertIn("发票备注交易时间", result["failure_reason"])
         self.assertIn("比加油明细交易时间", result["failure_reason"])
-        self.assertIn("早1秒", result["failure_reason"])
+        self.assertIn("早10分钟1秒", result["failure_reason"])
         self.assertNotIn("时间先后异常", result["failure_reason"])
         workbook = self.open_result(summary)
-        self.assertEqual(workbook.worksheets[0].cell(result["row"], len(fixtures.OUTPUT_FUEL_HEADERS)).value, result["failure_reason"])
+        self.assertEqual(workbook.worksheets[0].cell(result["row"], len(fixtures.OUTPUT_FUEL_HEADERS) - 1).value, result["failure_reason"])
         invoice_result = self.invoice_rows(summary)[0]
         self.assertEqual(invoice_result["failure_reason"], result["failure_reason"])
         self.assertFalse(invoice_result["red"])
@@ -329,8 +330,7 @@ class LatestPlanTests(unittest.TestCase):
         scenarios = [
             ([fixtures.fuel()], [fixtures.invoice(**{"合计金额（含税）": 100.01})]),
             ([fixtures.fuel()], [fixtures.invoice(数量=11)]),
-            ([fixtures.fuel()], [fixtures.invoice(备注="交易时间：2026-10-11 10:30:01 油枪号：4")]),
-            ([fixtures.fuel()], [fixtures.invoice(备注="交易时间：2026-10-11 09:59:59 油枪号：4")]),
+            ([fixtures.fuel()], [fixtures.invoice(备注="交易时间：2026-10-11 09:49:59 油枪号：4")]),
             ([fixtures.fuel()], []),
             ([], [fixtures.invoice()]),
             ([fixtures.fuel()], [fixtures.invoice(备注="交易时间：格式有误 油枪号：4")]),
@@ -338,7 +338,7 @@ class LatestPlanTests(unittest.TestCase):
         for fuels, invoices in scenarios:
             with self.subTest(fuels=fuels, invoices=invoices):
                 self.make_workbook(fuels, invoices)
-                summary = self.run_case(minutes_tolerance="30")
+                summary = self.run_case()
                 self.assertEqual(summary["matched"], 0)
                 workbook = self.open_result(summary)
                 self.assert_original_columns(workbook)
@@ -347,8 +347,10 @@ class LatestPlanTests(unittest.TestCase):
                     is_fuel = result["source"] == "加油明细记录"
                     self.assertIsNone(result["match_details"])
                     self.assertTrue(result["failure_reason"])
-                    self.assertEqual(result["red"], is_fuel)
+                    self.assertEqual(result["red"], is_fuel or not result["counterpart"])
                     if is_fuel:
+                        self.assert_red_row(sheet, result["row"])
+                    elif not result["counterpart"]:
                         self.assert_red_row(sheet, result["row"])
                     else:
                         self.assertTrue(all(cell.fill.fill_type is None for cell in sheet[result["row"]]))
@@ -412,12 +414,12 @@ class LatestPlanTests(unittest.TestCase):
             [fixtures.fuel(), fixtures.fuel(交易时间=datetime(2026, 10, 11, 10, 20), 流水号="F002")],
             [fixtures.invoice(备注="交易时间：2026-10-11 10:31:00 油枪号：4"), fixtures.invoice(备注="交易时间：2026-10-11 10:40:00 油枪号：4", 数电票号码="26447200000093907129")],
         )
-        summary = self.run_case(minutes_tolerance="30")
+        summary = self.run_case()
         fuels = self.fuel_rows(summary)
         self.assertEqual(summary["paired"], 2)
         self.assertEqual(self.counterpart_row(fuels[0]), 3)
         self.assertEqual(self.counterpart_row(fuels[1]), 4)
-        self.assertEqual(fuels[0]["status"], "时间超限")
+        self.assertEqual(fuels[0]["status"], "已匹配")
         self.assertEqual(fuels[1]["status"], "已匹配")
         self.assertEqual(Decimal(fuels[0]["time_diff"]), Decimal("31"))
         self.assertEqual(Decimal(fuels[1]["time_diff"]), Decimal("20"))

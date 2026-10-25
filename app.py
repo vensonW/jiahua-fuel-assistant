@@ -20,28 +20,27 @@ STATUSES = (
     "全部状态",
     "金额不符",
     "升数不符",
-    "时间超限",
     "时间先后异常",
     "无对应记录",
     "待确认",
 )
 HELP_TEXT = """加华油站小助手使用说明
 
-1. 分别选择包含加油、发票数据的工作簿和发票审核单（选择 invoiceList_*.xlsx 原文件，不选 ~$ 开头的临时文件）。审核单中被红冲或作废的发票在核对前过滤，不参与配对，也不进入“发票未配对”切页；原始发票切页保留。工具按表头识别切页，优先使用带“资料区间”的发票页。发票备注中的站点会出现在“审核站点”，支持多选和全选；仅核对勾选站点。
+1. 分别选择包含加油、发票数据的工作簿和发票审核单（选择 invoiceList_*.xlsx 原文件，不选 ~$ 开头的临时文件）。输入工作簿会自动备份后直接标注；审核单中被红冲或作废的发票不参与配对和标色。工具按表头识别切页，优先使用带“资料区间”的发票页。发票备注中的站点会出现在“审核站点”，支持多选和全选；仅核对勾选站点。
 
-2. 选择工作簿后，开始、结束日期自动设为加油明细“交易时间”的最早、最晚日期；日历只能选择这个范围内的日期。可勾选“指定时刻”选择时、分、秒；仅选日期时，开始取当天 00:00:00，结束包含当天全部时间。点击“全部加油日期”可恢复完整加油日期范围。所选时间超出加油明细日期范围，或与发票资料区间不重叠时，直接提示而不开始核对。
+2. 选择工作簿后，开始、结束日期自动设为加油明细“交易时间”的最早、最晚日期；也可自由选择其他日期。可勾选“指定时刻”选择时、分、秒；仅选日期时，开始取当天 00:00:00，结束包含当天全部时间。点击“全部加油日期”可恢复默认范围。所选时间段没有可核对记录时会提示。
 
-3. 界面“加油明细切页-交易时间”取自加油原表，“发票-交易时间”取自发票备注；“开票时间”另行展示。两处交易时间相差应在设置的时间间隔内（默认 60 分钟，含边界）；若发票交易时间比加油明细交易时间更早，核对状态显示“时间先后异常”，失败原因列出两处原始时间与相差时长。
+3. 界面“加油明细切页-交易时间”取自加油原表，“发票-交易时间”取自发票备注；“开票时间”另行展示。发票交易时间晚于加油明细交易时间不限间隔；早于开始时间不超过 10 分钟也视为正常，超过 10 分钟则显示“时间先后异常”。
 
 4. 加油表“交易金额”已扣除优惠，直接与发票“合计金额（含税）”按原始数值严格比较，不再重复扣减优惠。加油量与发票数量也必须完全一致；优惠金额仅供查看，不参与核对。
 
-5. 同枪号、同油品、同升数的重复候选按双方时间顺序一一配对，注明“按时间顺序推定”，不能为使金额相等而调换顺序；有多余发票候选时，在不减少配对数或打乱顺序的前提下优先完全符合的发票。每笔记录只使用一次；重复票号、同票多行或其他证据不足的情况标为待确认。
+5. 同站同枪同油品同升数的重复候选默认按时间顺序配对；仅在加油后60分钟内金额对应唯一、两侧均无歧义且不减少配对数时，自动纠正交叉配对并注明依据。其余情况保持原顺序；每笔记录只使用一次，重复票号、同票多行或其他证据不足的情况标为待确认。
 
-6. 金额只要有差异，即使相差 0.01 元，也判为“金额不符”。付款类型为“记账卡”时，在加油明细及匹配失败切页整行标浅黄底；其他不符、无对应记录、待确认的加油原行标浅红底；发票页不新增标红。多项问题、疑似对应位置及差异写入核对日志和界面预览，存在金额差时主状态优先显示金额不符。
+6. 金额只要有差异，即使相差 0.01 元，也判为“金额不符”。付款类型为“记账卡”时，加油行仍标浅黄底；其他加油失败行和未配对发票在原发票切页及油站切页均标浅红底。加油明细末尾新增“失败原因”“关联发票号”，找不到对应发票时票号留空。
 
 7. 备注缺少结束时间时，允许使用开票时间辅助判断并注明来源，日志和预览中的加油结束时间保持空白；备注时间存在但格式无效时标为待确认。备注交易时间、油枪号及时间来源在日志和预览中展示。
 
-8. 结果工作簿另存到输出目录，重名时自动追加序号。原始切页不排序：加油明细页末尾新增“失败原因”列，成功记录留空；发票页在“备注”右侧新增“交易时间”列。每个勾选站点新增以站点名称命名的切页，不追加“发票”二字，按开票时间从早到晚排列（无有效开票时间的排在最后）；对应发票位置与失败原因引用排序后的站点切页行号。另增“匹配成功”“匹配失败”和“发票未配对”切页；匹配失败页只保存未通过的加油明细记录并新增“付款类型”列。匹配成功、匹配失败按加油交易时间升序，发票未配对按备注交易时间升序；发票未配对页的行号指向按开票时间排序后的站点切页，加油行号仍指向未排序的原始加油页。备注相同但票号不同的重复开票标为“重复发票：跟对应行是同一单”。新增切页首行带“资料区间”起止时间。其他原始字段、工作表、合计行、完整卡号和发票号码保留；付款类型为记账卡时在加油明细与匹配失败页标黄，其余加油异常原行标红。时间段之外的原记录保留原样并跳过，不计入异常、预览或日志。
+8. 点击“打开已标注原文件”直接查看输入工作簿，其中新增所选油站切页，未配对发票整行标红；同目录生成避重名的核对前备份。结果工作簿仍另存到输出目录，保留所选站点及“匹配成功”“匹配失败”“发票未配对”切页，并在发票原切页“备注”右侧新增“交易时间”。结果工作簿可从输出目录打开。重复核对已标注原文件会刷新旧标注和油站切页，不重复添加列；时间段外记录不新增标注。
 
 9. 与结果工作簿同名的 .log 文件保存在输出目录的 logs 文件夹，只保存匹配失败的记录，包括对应位置、金额差、升数差、时间差、失败原因和配对依据。新核对成功后，删除同一输入文件的旧核对日志，保留其他文件。成功记录在“匹配成功”切页中按每对显示，包含油枪号、加油量、油品、加油时间、发票号码等信息。双击预览行可查看完整内容。
 
@@ -135,12 +134,9 @@ def set_window_icon(window: tk.Tk | tk.Toplevel, *, default: bool = False) -> No
 
 
 class DateTimePicker(tk.Toplevel):
-    def __init__(self, parent: tk.Tk, variable: tk.StringVar, label: str, anchor: ttk.Button,
-                 min_date: date | None = None, max_date: date | None = None) -> None:
+    def __init__(self, parent: tk.Tk, variable: tk.StringVar, label: str, anchor: ttk.Button) -> None:
         super().__init__(parent)
         self.variable = variable
-        self.min_date = min_date
-        self.max_date = max_date
         self.title(f"选择{label}")
         self.resizable(False, False)
         self.transient(parent)
@@ -148,10 +144,6 @@ class DateTimePicker(tk.Toplevel):
         current = variable.get()
         chosen = datetime.fromisoformat(current) if current else datetime.combine(date.today(), datetime.min.time())
         selected_day = chosen.date()
-        if min_date and selected_day < min_date:
-            selected_day = min_date
-        if max_date and selected_day > max_date:
-            selected_day = max_date
         self.selected_date = selected_day
         self.year = tk.StringVar(value=str(selected_day.year))
         self.month = tk.StringVar(value=f"{selected_day.month:02d}")
@@ -165,18 +157,14 @@ class DateTimePicker(tk.Toplevel):
         header = ttk.Frame(panel)
         header.pack(fill="x", pady=(0, 8))
         ttk.Button(header, text="‹", width=3, command=lambda: self._shift_month(-1)).pack(side="left")
-        first_year = min_date.year if min_date else 2000
-        last_year = max_date.year if max_date else 2100
-        year = ttk.Combobox(header, textvariable=self.year, values=tuple(str(value) for value in range(first_year, last_year + 1)), state="readonly", width=6)
+        year = ttk.Spinbox(header, textvariable=self.year, from_=1, to=9999, state="readonly", width=6, command=self._change_month)
         year.pack(side="left", padx=(10, 4))
         ttk.Label(header, text="年").pack(side="left")
-        month = ttk.Combobox(header, textvariable=self.month, state="readonly", width=4)
+        month = ttk.Combobox(header, textvariable=self.month, values=tuple(f"{value:02d}" for value in range(1, 13)), state="readonly", width=4)
         self.month_combo = month
-        self._update_month_options()
         month.pack(side="left", padx=(8, 4))
         ttk.Label(header, text="月").pack(side="left")
         ttk.Button(header, text="›", width=3, command=lambda: self._shift_month(1)).pack(side="right")
-        year.bind("<<ComboboxSelected>>", self._change_month)
         month.bind("<<ComboboxSelected>>", self._change_month)
 
         self.calendar = ttk.Frame(panel)
@@ -216,33 +204,15 @@ class DateTimePicker(tk.Toplevel):
             for column, day in enumerate(week):
                 if day:
                     selected = day == self.selected_date.day and int(self.month.get()) == self.selected_date.month and int(self.year.get()) == self.selected_date.year
-                    candidate = date(int(self.year.get()), int(self.month.get()), day)
-                    available = (self.min_date is None or candidate >= self.min_date) and (self.max_date is None or candidate <= self.max_date)
-                    ttk.Button(self.calendar, text=str(day), width=3, style="CalendarSelected.TButton" if selected else "Calendar.TButton", state="normal" if available else "disabled", command=lambda value=day: self._select_day(value)).grid(row=row, column=column, padx=1, pady=1)
-
-    def _update_month_options(self) -> None:
-        year = int(self.year.get())
-        first = self.min_date.month if self.min_date and year == self.min_date.year else 1
-        last = self.max_date.month if self.max_date and year == self.max_date.year else 12
-        self.month_combo.configure(values=tuple(f"{value:02d}" for value in range(first, last + 1)))
-        if int(self.month.get()) < first or int(self.month.get()) > last:
-            self.month.set(f"{max(first, min(last, int(self.month.get()))):02d}")
+                    ttk.Button(self.calendar, text=str(day), width=3, style="CalendarSelected.TButton" if selected else "Calendar.TButton", command=lambda value=day: self._select_day(value)).grid(row=row, column=column, padx=1, pady=1)
 
     def _select_day(self, day: int) -> None:
-        candidate = date(int(self.year.get()), int(self.month.get()), day)
-        if (self.min_date and candidate < self.min_date) or (self.max_date and candidate > self.max_date):
-            return
-        self.selected_date = candidate
+        self.selected_date = date(int(self.year.get()), int(self.month.get()), day)
         self._draw_calendar()
 
     def _change_month(self, _event: object = None) -> None:
-        self._update_month_options()
         year, month = int(self.year.get()), int(self.month.get())
         self.selected_date = date(year, month, min(self.selected_date.day, monthrange(year, month)[1]))
-        if self.min_date and self.selected_date < self.min_date:
-            self.selected_date = self.min_date
-        if self.max_date and self.selected_date > self.max_date:
-            self.selected_date = self.max_date
         self._draw_calendar()
 
     def _shift_month(self, step: int) -> None:
@@ -252,7 +222,7 @@ class DateTimePicker(tk.Toplevel):
         elif month == 13:
             year, month = year + 1, 1
         candidate = date(year, month, 1) if 1 <= year <= 9999 else None
-        if candidate and (not self.min_date or candidate >= self.min_date.replace(day=1)) and (not self.max_date or candidate <= self.max_date.replace(day=1)):
+        if candidate:
             self.year.set(str(year))
             self.month.set(f"{month:02d}")
             self._change_month()
@@ -283,7 +253,6 @@ class ReconciliationApp:
         self.start_text = tk.StringVar()
         self.end_text = tk.StringVar()
         self.worker_count = tk.StringVar(value="20")
-        self.minutes_tolerance = tk.StringVar(value="60")
         self.rules_text = tk.StringVar()
         self.red_only = tk.BooleanVar(value=False)
         self.status_filter = tk.StringVar(value=STATUSES[0])
@@ -297,6 +266,8 @@ class ReconciliationApp:
         self.busy = False
         self.results: list[dict] = []
         self.output_path: Path | None = None
+        self.annotated_input_path: Path | None = None
+        self.input_backup_path: Path | None = None
         self.log_path: Path | None = None
         self.help_window: tk.Toplevel | None = None
         self.setting_controls: list[ttk.Widget] = []
@@ -409,11 +380,6 @@ class ReconciliationApp:
         self.worker_combo = ttk.Combobox(workers, textvariable=self.worker_count, values=tuple(str(count) for count in range(1, 33)), state="readonly", width=5)
         self.worker_combo.pack(side="left")
         self.setting_controls.append(self.worker_combo)
-        ttk.Label(workers, text="筛选时间间隔").pack(side="left", padx=(20, 8))
-        self.minutes_entry = ttk.Entry(workers, textvariable=self.minutes_tolerance, width=8)
-        self.minutes_entry.pack(side="left")
-        ttk.Label(workers, text="分钟").pack(side="left", padx=(6, 0))
-        self.setting_controls.append(self.minutes_entry)
         station_frame = ttk.Frame(form)
         station_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ttk.Label(station_frame, text="审核站点").pack(side="left", padx=(0, 12))
@@ -437,7 +403,7 @@ class ReconciliationApp:
         actions.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 4))
         self.run_button = ttk.Button(actions, text="开始核对", command=self._start_run, style="Primary.TButton")
         self.run_button.pack(side="left")
-        self.open_button = ttk.Button(actions, text="打开结果工作簿", command=self._open_result, state="disabled")
+        self.open_button = ttk.Button(actions, text="打开已标注原文件", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(8, 0))
         self.log_button = ttk.Button(actions, text="打开核对日志", command=self._open_log, state="disabled")
         self.log_button.pack(side="left", padx=(8, 0))
@@ -457,7 +423,6 @@ class ReconciliationApp:
             justify="left",
         )
         rules.pack(anchor="w", pady=(10, 8))
-        self.minutes_tolerance.trace_add("write", self._update_rules)
         self._update_rules()
         ttk.Label(outer, textvariable=self.summary_text, justify="left", style="Page.TLabel").pack(anchor="w", pady=(0, 8))
 
@@ -465,7 +430,7 @@ class ReconciliationApp:
         footer.pack(side="bottom", fill="x", pady=(8, 0))
         status_label = ttk.Label(footer, textvariable=self.status_text, wraplength=1040, style="Page.TLabel")
         status_label.pack(anchor="w", fill="x")
-        ttk.Label(footer, text="原文件保留；Excel 加油页新增失败原因，发票页新增交易时间。点击对应位置打开 Excel，双击其他列查看详情。", style="Footer.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(footer, text="原文件自动备份后直接标注；新增油站切页，未配对发票在原页和油站页标红。", style="Footer.TLabel").pack(anchor="w", pady=(4, 0))
         footer.bind("<Configure>", lambda event: status_label.configure(wraplength=max(1, event.width)))
 
         pages = ttk.Notebook(outer)
@@ -529,10 +494,9 @@ class ReconciliationApp:
 
     def _choose_datetime(self, variable: tk.StringVar, label: str, anchor: ttk.Button) -> None:
         if not self.fuel_date_range:
-            messagebox.showerror("尚未读取日期", "请先选择数据工作簿，等待加油明细日期范围识别完成。", parent=self.root)
+            messagebox.showerror("尚未读取日期", "请先选择数据工作簿，等待加油明细默认日期识别完成。", parent=self.root)
             return
-        first, last = (date.fromisoformat(value) for value in self.fuel_date_range)
-        DateTimePicker(self.root, variable, label, anchor, first, last)
+        DateTimePicker(self.root, variable, label, anchor)
 
     def _clear_period(self) -> None:
         self.start_text.set(self.fuel_date_range[0] if self.fuel_date_range else "")
@@ -590,7 +554,7 @@ class ReconciliationApp:
 
             names, interval, fuel_range = scan_workbook_metadata(path)
             if fuel_range is None:
-                raise ValueError("加油明细切页未找到有效交易时间，无法确定可选日期范围")
+                raise ValueError("加油明细切页未找到有效交易时间，无法确定默认日期范围")
             self.events.put(("stations", (scan_id, path, names, interval, fuel_range, "")))
         except Exception as exc:
             self.events.put(("stations", (scan_id, path, [], None, None, str(exc))))
@@ -614,9 +578,8 @@ class ReconciliationApp:
             self.output_directory.set(selected)
 
     def _update_rules(self, *_args) -> None:
-        interval = self.minutes_tolerance.get().strip() or "所设"
         self.rules_text.set(
-            f"核对规则：交易金额已扣优惠，直接与发票金额比较；加油量与发票数量一致；结束－开始在 0—{interval} 分钟内（含边界）。\n"
+            "核对规则：交易金额已扣优惠，直接与发票金额比较；加油量与发票数量一致；不限制结束时间晚于开始时间的间隔，早于开始时间不超过 10 分钟也视为正常。\n"
             "发票备注交易时间为结束，结合油枪号和油品配对；缺失时用开票时间辅助。\n"
             "Excel 付款类型为记账卡的加油行标黄，其他加油异常行标红并写入失败原因；同名 .log 只记录失败。"
         )
@@ -632,7 +595,6 @@ class ReconciliationApp:
             "date_text": "",
             "start_text": self.start_text.get().strip(),
             "end_text": self.end_text.get().strip(),
-            "minutes_tolerance": self.minutes_tolerance.get().strip(),
             "red_only": False,
             "worker_count": self.worker_count.get(),
         }
@@ -662,21 +624,8 @@ class ReconciliationApp:
             parameters["worker_count"] = int(parameters["worker_count"])
             if not 1 <= parameters["worker_count"] <= 32:
                 raise ValueError("并发工作数须为 1—32 的整数。")
-            from reconciliation import decimal_value, parse_period
-
-            minutes_limit = decimal_value(parameters["minutes_tolerance"], "筛选时间间隔")
-            if not 0 <= minutes_limit <= 525600:
-                raise ValueError("筛选时间间隔须为 0—525600 分钟。")
-            selected_period = parse_period(date_text="", start_text=parameters["start_text"], end_text=parameters["end_text"])
-            if self.fuel_date_range and selected_period.start:
-                first, last = (date.fromisoformat(value) for value in self.fuel_date_range)
-                if selected_period.start.date() < first or selected_period.end.date() > last:
-                    raise ValueError(f"核对时间须在加油明细日期范围 {first} 至 {last} 内，请重新选择。")
-            if self.invoice_interval and selected_period.start:
-                invoice_start = datetime.combine(date.fromisoformat(self.invoice_interval[0]), datetime.min.time())
-                invoice_end = datetime.combine(date.fromisoformat(self.invoice_interval[1]), datetime.max.time())
-                if selected_period.end < invoice_start or selected_period.start > invoice_end:
-                    raise ValueError(f"所选核对时间段与发票资料区间 {self.invoice_interval[0]} 至 {self.invoice_interval[1]} 不重叠，请调整时间。")
+            from reconciliation import parse_period
+            parse_period(date_text="", start_text=parameters["start_text"], end_text=parameters["end_text"])
         except ValueError as exc:
             messagebox.showerror("设置有误", str(exc), parent=self.root)
             return
@@ -684,6 +633,8 @@ class ReconciliationApp:
         save_last_invoice_audit_path(parameters["invoice_audit_path"])
         self.busy = True
         self.output_path = None
+        self.annotated_input_path = None
+        self.input_backup_path = None
         self.log_path = None
         self.open_button.configure(state="disabled")
         self.log_button.configure(state="disabled")
@@ -753,6 +704,8 @@ class ReconciliationApp:
                     self.progress.stop()
                     self._finish_run()
                     self.output_path = Path(payload["output_path"])
+                    self.annotated_input_path = Path(payload["annotated_input_path"])
+                    self.input_backup_path = Path(payload["input_backup_path"])
                     self.log_path = Path(payload["log_path"])
                     self.results = payload.get("results", [])
                     self.progress.configure(mode="determinate", maximum=100, value=100)
@@ -763,9 +716,9 @@ class ReconciliationApp:
                     self.summary_text.set(
                         f"加油记录 {payload['total_fuel']} 条　发票记录 {payload['total_invoice']} 条　对应 {payload['paired']} 对　"
                         f"已匹配 {payload['matched']} 对，其余需核查　已过滤无效发票 {payload.get('filtered_invoice_count', 0)} 条　核对耗时：{payload['elapsed_text']}\n"
-                        f"加油明细异常 {payload['red_fuel']} 条并写入失败原因；付款类型为记账卡的行标黄，其他异常行标红。失败记录见结果工作簿的“匹配失败”切页和同名 .log。"
+                        f"原文件已标注：加油异常 {payload['red_fuel']} 条，未配对发票 {payload['red_invoice']} 条；记账卡仍标黄。"
                     )
-                    status = f"核对完成，工作簿：{self.output_path}\n核对日志：{self.log_path}"
+                    status = f"已标注原文件：{self.annotated_input_path}\n核对前备份：{self.input_backup_path}\n结果工作簿：{self.output_path}\n核对日志：{self.log_path}"
                     if payload.get("log_cleanup_warning"):
                         status += f"\n{payload['log_cleanup_warning']}"
                     self.status_text.set(status)
@@ -885,11 +838,11 @@ class ReconciliationApp:
             messagebox.showerror("无法打开", f"请手动打开：\n{path}\n\n{exc}", parent=self.root)
 
     def _open_result(self) -> None:
-        if self.output_path is not None:
-            if self.output_path.is_file():
-                self._open_path(self.output_path)
+        if self.annotated_input_path is not None:
+            if self.annotated_input_path.is_file():
+                self._open_path(self.annotated_input_path)
             else:
-                messagebox.showerror("结果文件不存在", f"结果文件可能已被移动或删除：\n{self.output_path}", parent=self.root)
+                messagebox.showerror("原文件不存在", f"已标注原文件可能已被移动或删除：\n{self.annotated_input_path}", parent=self.root)
 
     def _open_log(self) -> None:
         if self.log_path is not None:

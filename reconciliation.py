@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import os
 import re
+import shutil
 import tempfile
 import time as clock_time
 from typing import Callable
@@ -28,6 +29,8 @@ from openpyxl.worksheet.filters import ColorFilter, FilterColumn
 
 RED = "FFFFC7CE"
 YELLOW = "FFFFF2CC"
+ANNOTATION_SHEET = "_加华核对标色记录"
+ANNOTATION_MARKER = "JH_AUDIT_V1"
 FUEL_ALIASES = {
     "gun": ["枪号", "油枪号"], "time": ["交易时间", "加油时间"],
     "oil": ["油品", "油品名称"], "volume": ["加油量", "升数", "加油升数"],
@@ -231,11 +234,14 @@ def _invoice_station(remark, fallback=""):
 
 def _locate_sheets(workbook):
     candidates = defaultdict(list)
+    generated_sheets = set(_generated_station_names(workbook))
     options = (
         ("fuel", FUEL_ALIASES, ["gun", "time", "oil", "volume", "trade"]),
         ("invoice", INVOICE_ALIASES, ["time", "amount", "remark", "oil", "volume"]),
     )
     for ws in workbook.worksheets:
+        if ws.title == ANNOTATION_SHEET or ws.title in generated_sheets:
+            continue
         if hasattr(ws, "reset_dimensions"):
             ws.reset_dimensions()
         found = _find_header(ws, options)
@@ -255,6 +261,103 @@ def _locate_sheets(workbook):
             options = preferred
         found[kind] = options[0]
     return found
+
+
+def _generated_station_names(workbook):
+    if ANNOTATION_SHEET not in workbook:
+        return []
+    metadata = workbook[ANNOTATION_SHEET]
+    count = metadata["E1"].value
+    if not isinstance(count, int) or count < 0 or count > len(workbook.sheetnames):
+        return []
+    return [metadata.cell(row, 4).value for row in range(2, count + 2)]
+
+
+def _restore_annotations(workbook):
+    fuel_ws, header, _ = _locate_sheets(workbook)["fuel"]
+    labels = [str(fuel_ws.cell(header, column).value or "").strip() for column in range(1, fuel_ws.max_column + 1)]
+    metadata = workbook[ANNOTATION_SHEET] if ANNOTATION_SHEET in workbook else None
+    if metadata is None:
+        if "失败原因" in labels or "关联发票号" in labels:
+            raise ReconciliationError("输入工作簿含核对标注列但缺少工具元数据，请使用未标注原件或核对前备份")
+        return False
+    if metadata["A1"].value != ANNOTATION_MARKER or labels[-2:] != ["失败原因", "关联发票号"]:
+        raise ReconciliationError("输入工作簿的核对标注结构不完整，请使用核对前备份")
+    generated_sheets = _generated_station_names(workbook)
+    original_sources = {fuel_ws.title, _locate_sheets(workbook)["invoice"][0].title}
+    if (len(generated_sheets) != len(set(generated_sheets))
+            or any(not isinstance(name, str) or name not in workbook or name in original_sources for name in generated_sheets)):
+        raise ReconciliationError("输入工作簿的油站切页记录损坏，请使用核对前备份")
+    mark_count = metadata["H1"].value
+    if not isinstance(mark_count, int):
+        mark_count = metadata.max_row - 1
+    for row in metadata.iter_rows(min_row=2, max_row=mark_count + 1, max_col=3):
+        sheet_name, coordinate = row[0].value, row[1].value
+        if sheet_name not in workbook or not isinstance(coordinate, str):
+            raise ReconciliationError("输入工作簿的标色记录损坏，请使用核对前备份")
+        workbook[sheet_name][coordinate].fill = copy(row[2].fill)
+    for name in generated_sheets:
+        workbook.remove(workbook[name])
+    fuel_ws.delete_cols(fuel_ws.max_column - 1, 2)
+    workbook.remove(metadata)
+    return True
+
+
+def _annotate_source(workbook, results, fuel_source, invoice_source, station_sheets, result_workbook):
+    fuel_ws, fuel_header, _ = _locate_sheets(workbook)["fuel"]
+    invoice_ws, invoice_header, _ = _locate_sheets(workbook)["invoice"]
+    original_fuel_columns = fuel_ws.max_column
+    reason_column = original_fuel_columns + 1
+    number_column = original_fuel_columns + 2
+    for column, label in ((reason_column, "失败原因"), (number_column, "关联发票号")):
+        cell = fuel_ws.cell(fuel_header, column, label)
+        cell._style = copy(fuel_ws.cell(fuel_header, original_fuel_columns)._style)
+    fuel_ws.column_dimensions[get_column_letter(reason_column)].width = 78
+    fuel_ws.column_dimensions[get_column_letter(number_column)].width = 28
+    for sheet_name in station_sheets.values():
+        original = result_workbook[sheet_name]
+        copied = workbook.create_sheet(sheet_name)
+        for row_number in range(1, original.max_row + 1):
+            _copy_row(original, copied, row_number, row_number, original.max_column)
+        for column, dimension in original.column_dimensions.items():
+            copied.column_dimensions[column].width = dimension.width
+        copied.freeze_panes = original.freeze_panes
+        copied.auto_filter.ref = original.auto_filter.ref
+    metadata = workbook.create_sheet(ANNOTATION_SHEET)
+    metadata["A1"] = ANNOTATION_MARKER
+    metadata["E1"] = len(station_sheets)
+    for index, sheet_name in enumerate(station_sheets.values(), 2):
+        metadata.cell(index, 4, sheet_name)
+    metadata.sheet_state = "veryHidden"
+    next_row = 2
+
+    def mark(sheet, row_number, last_column, fill):
+        nonlocal next_row
+        for column in range(1, last_column + 1):
+            cell = sheet.cell(row_number, column)
+            metadata.cell(next_row, 1, sheet.title)
+            metadata.cell(next_row, 2, cell.coordinate)
+            metadata.cell(next_row, 3).fill = copy(cell.fill)
+            cell.fill = copy(fill)
+            next_row += 1
+
+    for result in results:
+        if result["source"] == fuel_source:
+            row_number = result["row"]
+            fuel_ws.cell(row_number, reason_column, result["failure_reason"] or None)
+            fuel_ws.cell(row_number, number_column, result["invoice_number"] if result["counterpart"] else None)
+            fill = PatternFill("solid", fgColor=YELLOW if result.get("payment_type") == "记账卡" else RED) if result["red"] or result.get("payment_type") == "记账卡" else None
+            if fill is not None:
+                mark(fuel_ws, row_number, original_fuel_columns, fill)
+                fuel_ws.cell(row_number, reason_column).fill = copy(fill)
+                fuel_ws.cell(row_number, number_column).fill = copy(fill)
+        elif result["source"] == invoice_source and not result["counterpart"]:
+            mark(invoice_ws, result["row"], invoice_ws.max_column, PatternFill("solid", fgColor=RED))
+    fuel_ws.auto_filter.ref = f"A{fuel_header}:{get_column_letter(number_column)}{fuel_ws.max_row}"
+    if not invoice_ws.auto_filter.ref:
+        invoice_ws.auto_filter.ref = f"A{invoice_header}:{get_column_letter(invoice_ws.max_column)}{invoice_ws.max_row}"
+    metadata["H1"] = next_row - 2
+    return original_fuel_columns
 
 
 def _invoice_interval_text(ws, header):
@@ -460,30 +563,17 @@ def _compatible(a, b):
             and (not a.station or not b.station or normalize_station(a.station) == normalize_station(b.station)))
 
 
-def _edge_type(a, b, amount_limit, seconds_limit):
+def _edge_type(a, b, amount_limit):
     if not _compatible(a, b):
         return None
     amount_ok = abs(b.amount - a.amount) <= amount_limit
     volume_ok = b.volume == a.volume
-    time_near = abs(_time_seconds(a, b)) <= seconds_limit
-    nearby_day = abs((a.time.date() - b.time.date()).days) <= 1
     strong_identity = bool(a.gun and b.gun and a.oil and b.oil)
-    # Amount is the result of the audit, not a reason to reorder otherwise
-    # identical transactions. Reserve same-volume chronological counterparts
-    # even when their amounts disagree.
-    # Include over-limit counterparts in the SAME chronological alignment.
-    # Splitting them into a later stage can consume a later fueling's earlier
-    # invoice first and reverse two otherwise identical transactions.
-    if volume_ok and nearby_day and (strong_identity or time_near):
+    if volume_ok and strong_identity:
         return 0
-    # Do not infer a counterpart across distant days from a repeated amount alone.
-    if not nearby_day:
-        return None
-    if not time_near and volume_ok and (amount_ok or (a.gun and b.gun and a.oil and b.oil)):
+    if volume_ok and (amount_ok or a.gun and b.gun or a.oil and b.oil):
         return 1
-    if time_near and (amount_ok or volume_ok):
-        return 1
-    if time_near and a.gun and b.gun and a.oil and b.oil:
+    if strong_identity or (amount_ok and (a.gun and b.gun or a.oil and b.oil)):
         return 2
     return None
 
@@ -546,6 +636,75 @@ def _assign_ordered(fuel, invoices, edges):
     return pairs
 
 
+def _repair_unique_amount_crossings(fuel, invoices, assignments):
+    if len(assignments) < 2:
+        return set()
+
+    def record_key(record):
+        if (record.issues or not record.in_scope or record.time is None or record.amount is None
+                or record.volume is None or not (record.station and record.gun and record.oil)):
+            return None
+        return (normalize_station(record.station), record.gun, record.oil, record.volume, record.amount)
+
+    def index_records(records):
+        groups = defaultdict(list)
+        for record_index, record in enumerate(records):
+            key = record_key(record)
+            if key is not None:
+                groups[key].append((record.time, record_index))
+        indexed = {}
+        for key, group in groups.items():
+            ordered = sorted(group)
+            indexed[key] = ([item[0] for item in ordered], [item[1] for item in ordered])
+        return indexed
+
+    fuel_index = index_records(fuel)
+    invoice_index = index_records(invoices)
+    invoice_owner = {invoice_number: fuel_number for fuel_number, invoice_number in assignments.items()}
+    window = timedelta(minutes=60)
+    unique_matches = {}
+    for fuel_number, invoice_number in assignments.items():
+        record = fuel[fuel_number]
+        key = record_key(record)
+        current_key = record_key(invoices[invoice_number])
+        if key is None or current_key is None or key[:-1] != current_key[:-1]:
+            continue
+        invoice_times, invoice_numbers = invoice_index.get(key, ([], []))
+        first = bisect_left(invoice_times, record.time)
+        last = bisect_right(invoice_times, record.time + window)
+        if last - first != 1:
+            continue
+        candidate_number = invoice_numbers[first]
+        candidate = invoices[candidate_number]
+        fuel_times, fuel_numbers = fuel_index[key]
+        first = bisect_left(fuel_times, candidate.time - window)
+        last = bisect_right(fuel_times, candidate.time)
+        if last - first != 1 or fuel_numbers[first] != fuel_number or candidate_number not in invoice_owner:
+            continue
+        unique_matches[fuel_number] = candidate_number
+
+    crossed = set()
+    visited = set()
+    for start in sorted(unique_matches):
+        if start in visited:
+            continue
+        path = []
+        positions = {}
+        current = start
+        while current in unique_matches and current not in positions and current not in visited:
+            positions[current] = len(path)
+            path.append(current)
+            current = invoice_owner[unique_matches[current]]
+        if current in positions:
+            cycle = path[positions[current]:]
+            if len(cycle) > 1:
+                crossed.update(cycle)
+        visited.update(path)
+    for fuel_number in crossed:
+        assignments[fuel_number] = unique_matches[fuel_number]
+    return crossed
+
+
 def _plain(value):
     return format(value, "f") if value is not None else None
 
@@ -586,7 +745,7 @@ def _detail(a, b):
     ])
 
 
-def _pair_result(a, b, amount_limit, seconds_limit, duplicate=False):
+def _pair_result(a, b, amount_limit, duplicate=False, crossed=False):
     amount_diff, volume_diff = b.amount - a.amount, b.volume - a.volume
     seconds = _time_seconds(a, b)
     failures = []
@@ -600,16 +759,13 @@ def _pair_result(a, b, amount_limit, seconds_limit, duplicate=False):
         direction = "多" if volume_diff > 0 else "少"
         failure_details.append(f"升数不符：发票数量{_plain(b.volume)}升，比加油明细加油量{_plain(a.volume)}升{direction}{_plain(abs(volume_diff))}升")
     invoice_time_label = "发票备注交易时间" if b.end_time is not None else "发票开票时间（备注缺少交易时间，仅用于辅助判断）"
-    if seconds > seconds_limit:
-        failures.append("时间超限")
-        failure_details.append(f"时间超限：{invoice_time_label}（{_format_time(b.time)}）比加油明细交易时间（{_format_time(a.time)}）晚{_format_duration(seconds)}，超过允许的{_format_duration(seconds_limit)}")
-    if seconds < 0:
+    if seconds < -600:
         failures.append("时间先后异常")
         failure_details.append(f"{invoice_time_label}（{_format_time(b.time)}）比加油明细交易时间（{_format_time(a.time)}）早{_format_duration(seconds)}，请核对两处原始时间")
     incomplete = not (a.gun and b.gun and a.oil and b.oil)
     if amount_diff != 0:
         status = "金额不符"
-    elif seconds < 0:
+    elif seconds < -600:
         status = "时间先后异常"
     elif len(failures) > 1 or incomplete:
         status = "待确认"
@@ -618,9 +774,11 @@ def _pair_result(a, b, amount_limit, seconds_limit, duplicate=False):
     else:
         status = "已匹配"
     basis = [f"枪号{a.gun or b.gun or '缺失'}；油品{a.oil or b.oil or '缺失'}；油站{a.station or b.station or '未提供'}",
-             f"应开=交易金额（已含优惠）；金额和加油升数必须完全一致；发票交易时间减加油明细交易时间在0—{seconds_limit / 60}分钟内",
+             "应开=交易金额（已含优惠）；金额和加油升数必须完全一致；不限制结束时间晚于开始时间的间隔，提前不超过10分钟视为正常",
              f"时间使用{b.time_source}" + ("（结束时间缺失，开票时间仅作辅助）" if b.end_time is None else "（加油结束时间）")]
-    if duplicate:
+    if crossed:
+        basis.append("同站同枪同油品同升数的候选存在时间顺序交叉，按60分钟内唯一相等金额的一对一对应调整配对")
+    elif duplicate:
         basis.append("重复候选按时间顺序推定，按交易时间顺序一一配对（同秒按原行号）；不减少配对数或打乱顺序时优先完全符合的发票，每笔只用一次")
     if failures:
         basis.append("不符项：" + "、".join(failures))
@@ -632,7 +790,8 @@ def _pair_result(a, b, amount_limit, seconds_limit, duplicate=False):
     invoice_source = b.reference_source or b.source
     invoice_row = b.reference_row or b.row
     if status != "已匹配":
-        failure_reason = f"对应发票切页“{invoice_source}”第{invoice_row}行；{failure_reason}".rstrip("；")
+        invoice_number = f"（发票号码：{b.number}）" if b.number else ""
+        failure_reason = f"对应发票切页“{invoice_source}”第{invoice_row}行{invoice_number}；{failure_reason}".rstrip("；")
     common = dict(expected=_plain(a.amount), actual=_plain(b.amount), amount_diff=_plain(amount_diff),
                   volume_diff=_plain(volume_diff), time_diff=_plain((seconds / 60).quantize(Decimal("0.000001"))),
                   status=status, failure_reason=failure_reason,
@@ -671,10 +830,10 @@ def _unpaired_result(record):
                 time_source=record.time_source, red=True)
 
 
-def _match(fuel, invoices, amount_limit, seconds_limit, worker_count=20, match_progress=None):
+def _match(fuel, invoices, amount_limit, worker_count=20, match_progress=None):
     active_fuel = {i for i, r in enumerate(fuel) if r.in_scope and not r.issues}
     active_inv = {j for j, r in enumerate(invoices) if r.in_scope and not r.issues}
-    used_fuel, used_inv, results = set(), set(), []
+    used_fuel, used_inv, assignments = set(), set(), {}
     duplicate_keys = Counter((normalize_station(r.station), r.gun, r.oil, r.volume) for r in fuel if not r.issues)
     candidate_counts = Counter()
     # Strong identity/quantity/time counterparts precede weaker diagnostics.
@@ -685,26 +844,22 @@ def _match(fuel, invoices, amount_limit, seconds_limit, worker_count=20, match_p
             available_by_gun = defaultdict(list)
             for invoice_index in available_inv:
                 available_by_gun[invoices[invoice_index].gun].append(invoice_index)
-            times_by_gun = {gun: [invoices[index].time for index in indices] for gun, indices in available_by_gun.items()}
-            all_times = [invoices[index].time for index in available_inv]
             remaining = sorted(active_fuel - used_fuel)
-            window = seconds_limit if stage == 2 else max(seconds_limit, Decimal(172800))
-            span = timedelta(seconds=float(window))
 
             def find_candidates(index):
                 record = fuel[index]
                 matches = []
-                groups = ((available_inv, all_times),) if not record.gun else tuple(
-                    (available_by_gun[gun], times_by_gun[gun])
+                groups = (available_inv,) if not record.gun else tuple(
+                    available_by_gun[gun]
                     for gun in (record.gun, "") if gun in available_by_gun
                 )
-                for indices, times in groups:
-                    for invoice_index in indices[bisect_left(times, record.time - span):bisect_right(times, record.time + span)]:
+                for indices in groups:
+                    for invoice_index in indices:
                         candidate = invoices[invoice_index]
-                        if _edge_type(record, candidate, amount_limit, seconds_limit) == stage:
+                        if _edge_type(record, candidate, amount_limit) == stage:
                             difference = _time_seconds(record, candidate)
                             valid = int(
-                                0 <= difference <= seconds_limit
+                                difference >= -600
                                 and abs(candidate.amount - record.amount) <= amount_limit
                                 and candidate.volume == record.volume
                                 and record.gun and candidate.gun and record.oil and candidate.oil
@@ -725,8 +880,13 @@ def _match(fuel, invoices, amount_limit, seconds_limit, worker_count=20, match_p
             for i, j in _assign_ordered(fuel, invoices, edges):
                 used_fuel.add(i)
                 used_inv.add(j)
-                duplicate = candidate_counts[i] > 1 or duplicate_keys[(normalize_station(fuel[i].station), fuel[i].gun, fuel[i].oil, fuel[i].volume)] > 1
-                results.extend(_pair_result(fuel[i], invoices[j], amount_limit, seconds_limit, duplicate))
+                assignments[i] = j
+    crossed = _repair_unique_amount_crossings(fuel, invoices, assignments)
+    results = []
+    for fuel_number, invoice_number in assignments.items():
+        record = fuel[fuel_number]
+        duplicate = candidate_counts[fuel_number] > 1 or duplicate_keys[(normalize_station(record.station), record.gun, record.oil, record.volume)] > 1
+        results.extend(_pair_result(record, invoices[invoice_number], amount_limit, duplicate, fuel_number in crossed))
     results.extend(_unpaired_result(r) for i, r in enumerate(fuel) if i not in used_fuel)
     results.extend(_unpaired_result(r) for j, r in enumerate(invoices) if j not in used_inv)
     return results, len(used_fuel)
@@ -792,6 +952,8 @@ def _add_result_sheets(workbook, invoice_ws, header, records, results, station_s
     interval = _invoice_interval_text(invoice_ws, header)
     if not interval:
         interval = f"资料区间：{_format_time(period.start)}~{_format_time(end)}" if period.start else "资料区间：全部时间"
+    unpaired_rows = {(result.get("reference_source"), result.get("reference_row"))
+                     for result in results if result["kind"] == "invoice" and not result["counterpart"]}
     for station, sheet_name in station_sheets.items():
         sheet = workbook[sheet_name]
         sheet.cell(1, 1, interval)
@@ -801,6 +963,9 @@ def _add_result_sheets(workbook, invoice_ws, header, records, results, station_s
         selected = _ordered_station_invoices(records, station)
         for target_row, record in enumerate(selected, 3):
             _copy_row(invoice_ws, sheet, record.row, target_row, invoice_columns)
+            if (sheet_name, target_row) in unpaired_rows:
+                for column in range(1, invoice_columns + 1):
+                    sheet.cell(target_row, column).fill = PatternFill("solid", fgColor=RED)
         sheet.freeze_panes = "A3"
         sheet.auto_filter.ref = f"A2:{get_column_letter(invoice_columns)}{max(2, len(selected) + 2)}"
     sheet = workbook.create_sheet(_unique_sheet_name(workbook, "匹配成功"))
@@ -833,8 +998,8 @@ def _add_result_sheets(workbook, invoice_ws, header, records, results, station_s
         ("invoice_time", "开票时间"), ("expected", "应开票金额"),
         ("actual", "实际发票金额"), ("amount_diff", "金额差（元）"),
         ("volume_diff", "升数差"), ("time_diff", "时间差（分）"),
-        ("status", "核对状态"), ("failure_reason", "失败原因"),
-        ("basis", "配对依据"), ("invoice_number", "发票号码"), ("card", "卡号"),
+        ("status", "核对状态"), ("invoice_number", "关联发票号"),
+        ("failure_reason", "失败原因"), ("basis", "配对依据"), ("card", "卡号"),
         ("payment_type", "付款类型"),
     ]
     failure.append([label for _, label in failure_fields])
@@ -858,8 +1023,9 @@ def _add_result_sheets(workbook, invoice_ws, header, records, results, station_s
     failure.auto_filter.ref = f"A2:{get_column_letter(len(failure_fields))}{max(2, failure.max_row)}"
     for index, (_, label) in enumerate(failure_fields, 1):
         failure.column_dimensions[get_column_letter(index)].width = max(14, min(45, len(label) * 2 + 4))
-    failure.column_dimensions["R"].width = 78
+    failure.column_dimensions["R"].width = 28
     failure.column_dimensions["S"].width = 78
+    failure.column_dimensions["T"].width = 78
     unpaired_sheet = workbook.create_sheet(_unique_sheet_name(workbook, "发票未配对"))
     unpaired_sheet.cell(1, 1, interval)
     metadata = ("发票切页行号", "油站", "核对状态", "未配对原因")
@@ -916,6 +1082,10 @@ def _export(wb, configurations, results, path, red_only, invoice_source, station
             for record in records:
                 cell = ws.cell(record.row, invoice_insert_column, _format_time(record.end_time))
                 cell._style = copy(ws.cell(record.row, remark_column)._style)
+            for result in by_source[ws.title]:
+                if not result["counterpart"]:
+                    for cell in ws[result["row"]][:original_columns + 1]:
+                        cell.fill = copy(red_fill)
             if ws.auto_filter.ref:
                 min_column, min_row, max_column, max_row = range_boundaries(ws.auto_filter.ref)
                 if max_column >= invoice_insert_column:
@@ -925,23 +1095,29 @@ def _export(wb, configurations, results, path, red_only, invoice_source, station
                             filtered.colId += 1
             continue
         reason_column = original_columns + 1
+        number_column = original_columns + 2
         reason_header = ws.cell(header, reason_column, "失败原因")
         reason_header._style = copy(ws.cell(header, original_columns)._style)
+        number_header = ws.cell(header, number_column, "关联发票号")
+        number_header._style = copy(ws.cell(header, original_columns)._style)
         ws.column_dimensions[get_column_letter(reason_column)].width = 78
+        ws.column_dimensions[get_column_letter(number_column)].width = 28
         for result in by_source[ws.title]:
             row = result["row"]
             reason_cell = ws.cell(row, reason_column, result["failure_reason"] or None)
             reason_cell._style = copy(ws.cell(row, original_columns)._style)
             reason_cell.alignment = Alignment(vertical="center", wrap_text=True)
+            number_cell = ws.cell(row, number_column, result["invoice_number"] if result["counterpart"] else None)
+            number_cell._style = copy(ws.cell(row, original_columns)._style)
             fill = yellow_fill if result.get("payment_type") == "记账卡" else red_fill if result["red"] else None
             if fill is not None:
-                for cells in ws.iter_rows(min_row=row, max_row=row, min_col=1, max_col=reason_column):
+                for cells in ws.iter_rows(min_row=row, max_row=row, min_col=1, max_col=number_column):
                     for cell in cells:
                         cell.fill = copy(fill)
             if red_only:
                 ws.row_dimensions[row].hidden = not result["red"]
         last_record = max((r.row for r in records), default=header)
-        ws.auto_filter.ref = f"A{header}:{get_column_letter(reason_column)}{last_record}"
+        ws.auto_filter.ref = f"A{header}:{get_column_letter(number_column)}{last_record}"
         ws.auto_filter.filterColumn = []
         if red_only and not any(result["red"] and result.get("payment_type") == "记账卡" for result in by_source[ws.title]):
             dxf_id = wb._differential_styles.add(DifferentialStyle(fill=red_fill))
@@ -953,7 +1129,8 @@ def _export(wb, configurations, results, path, red_only, invoice_source, station
     return invoice_insert_column, station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet
 
 
-def _preserve_cell_values(original, output, invoice_sheet_number=None, invoice_insert_column=None):
+def _preserve_cell_values(original, output, invoice_sheet_number=None, invoice_insert_column=None,
+                          column_limits=None, excluded_sheet_numbers=()):
     """Retain original string empties and formula caches lost by a library save.
 
     Shared strings are expanded to inline strings, keeping rich text. Only cell
@@ -970,10 +1147,17 @@ def _preserve_cell_values(original, output, invoice_sheet_number=None, invoice_i
         for name in source.namelist():
             if not re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name) or name not in target.namelist():
                 continue
+            sheet_number = int(name.rsplit("sheet", 1)[1].split(".", 1)[0])
+            if sheet_number in excluded_sheet_numbers:
+                continue
             source_root, target_root = ET.fromstring(source.read(name)), ET.fromstring(target.read(name))
             cells = {c.attrib["r"]: c for c in target_root.iter(tag("c"))}
             for original_cell in source_root.iter(tag("c")):
                 address = original_cell.attrib["r"]
+                if column_limits and sheet_number in column_limits:
+                    column_letter, _ = coordinate_from_string(address)
+                    if column_index_from_string(column_letter) > column_limits[sheet_number]:
+                        continue
                 if invoice_sheet_number is not None and name == f"xl/worksheets/sheet{invoice_sheet_number}.xml":
                     column_letter, row_number = coordinate_from_string(address)
                     column_number = column_index_from_string(column_letter)
@@ -1021,6 +1205,7 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
     check = load_workbook(path, data_only=False)
     original = load_workbook(original_path, data_only=False)
     try:
+        _restore_annotations(original)
         if check.sheetnames[:len(original.sheetnames)] != original.sheetnames:
             raise RuntimeError("输出工作表结构发生变化")
         if check.sheetnames[len(original.sheetnames):] != [*station_sheets.values(), success_sheet, failure_sheet, unpaired_invoice_sheet]:
@@ -1039,22 +1224,33 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
             actual_unpaired[(cell.value, cell.hyperlink.location if cell.hyperlink else "")] += 1
         if actual_unpaired != expected_unpaired:
             raise RuntimeError("发票未配对工作表记录不完整")
+        unpaired_positions = {(result["source"], result["row"]) for result in results
+                              if result["kind"] == "invoice" and not result["counterpart"]}
         config_by_name = {ws.title: (header, original_columns, records) for ws, header, original_columns, records in configurations}
         for result in results:
             header, original_columns, _ = config_by_name[result["source"]]
             ws = check[result["source"]]
             is_invoice = result["source"] == invoice_source
+            if is_invoice and not result["counterpart"] and result.get("reference_source") in station_sheets.values():
+                station_ws = check[result["reference_source"]]
+                if any(station_ws.cell(result["reference_row"], column).fill.fgColor.rgb != RED
+                       for column in range(1, station_ws.max_column + 1)):
+                    raise RuntimeError("油站切页未配对发票整行标色校验失败")
             if not is_invoice:
                 expected_fill = YELLOW if result.get("payment_type") == "记账卡" else RED if result["red"] else None
-                if expected_fill and any(ws.cell(result["row"], c).fill.fgColor.rgb != expected_fill for c in range(1, original_columns + 2)):
+                if expected_fill and any(ws.cell(result["row"], c).fill.fgColor.rgb != expected_fill for c in range(1, original_columns + 3)):
                     raise RuntimeError("加油明细整行标色校验失败")
             if not is_invoice and ws.cell(result["row"], original_columns + 1).value != (result["failure_reason"] or None):
                 raise RuntimeError("加油明细失败原因写入错误")
+            if not is_invoice and ws.cell(result["row"], original_columns + 2).value != (result["invoice_number"] if result["counterpart"] else None):
+                raise RuntimeError("加油明细关联发票号写入错误")
+            if is_invoice and not result["counterpart"] and any(ws.cell(result["row"], c).fill.fgColor.rgb != RED for c in range(1, original_columns + 2)):
+                raise RuntimeError("未配对发票整行标色校验失败")
         for configured_ws, header, original_columns, records in configurations:
             source_ws = original[configured_ws.title]
             target_ws = check[source_ws.title]
             is_invoice = source_ws.title == invoice_source
-            if target_ws.max_column != original_columns + 1:
+            if target_ws.max_column != original_columns + (1 if is_invoice else 2):
                 raise RuntimeError("原表列数发生变化")
             if source_ws.title != invoice_source and not target_ws.auto_filter.ref:
                 raise RuntimeError("输出筛选范围缺失")
@@ -1067,7 +1263,8 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
                 for record in records:
                     if target_ws.cell(record.row, invoice_insert_column).value != _format_time(record.end_time):
                         raise RuntimeError("发票交易时间提取错误")
-            elif target_ws.cell(header, original_columns + 1).value != "失败原因":
+            elif (target_ws.cell(header, original_columns + 1).value != "失败原因"
+                  or target_ws.cell(header, original_columns + 2).value != "关联发票号"):
                 raise RuntimeError("加油明细失败原因列缺失")
             for row in source_ws.iter_rows(max_col=original_columns):
                 for cell in row:
@@ -1078,11 +1275,95 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
                     saved_note = (saved.comment.text, saved.comment.author) if saved.comment else None
                     if original_note != saved_note:
                         raise RuntimeError("原表批注发生变化")
-                    if is_invoice and copy(saved.fill) != copy(cell.fill):
+                    if is_invoice and (source_ws.title, cell.row) not in unpaired_positions and copy(saved.fill) != copy(cell.fill):
                         raise RuntimeError("发票原有标色发生变化")
     finally:
         check.close()
         original.close()
+
+
+def _verify_annotated_source(path, original_path, result_path, results, fuel_source, invoice_source, station_sheets):
+    check = load_workbook(path, data_only=False)
+    original = load_workbook(original_path, data_only=False)
+    result_workbook = load_workbook(result_path, data_only=False)
+    try:
+        _restore_annotations(original)
+        if check.sheetnames != [*original.sheetnames, *station_sheets.values(), ANNOTATION_SHEET]:
+            raise RuntimeError("输入工作簿的工作表结构发生变化")
+        if check[ANNOTATION_SHEET]["A1"].value != ANNOTATION_MARKER or check[ANNOTATION_SHEET].sheet_state != "veryHidden":
+            raise RuntimeError("输入工作簿标色记录缺失")
+        if _generated_station_names(check) != list(station_sheets.values()):
+            raise RuntimeError("输入工作簿油站切页记录不完整")
+        for sheet_name in station_sheets.values():
+            saved_sheet = check[sheet_name]
+            output_sheet = result_workbook[sheet_name]
+            if (saved_sheet.max_row, saved_sheet.max_column, saved_sheet.auto_filter.ref) != (output_sheet.max_row, output_sheet.max_column, output_sheet.auto_filter.ref):
+                raise RuntimeError("输入工作簿油站切页结构错误")
+            for row in output_sheet:
+                for cell in row:
+                    saved_cell = saved_sheet[cell.coordinate]
+                    if saved_cell.value != cell.value or copy(saved_cell.fill) != copy(cell.fill):
+                        raise RuntimeError(f"输入工作簿油站切页内容或标色错误：{sheet_name}!{cell.coordinate}")
+        fuel_ws, header, _ = _locate_sheets(original)["fuel"]
+        width = fuel_ws.max_column
+        saved_fuel = check[fuel_source]
+        if (saved_fuel.max_column != width + 2 or saved_fuel.cell(header, width + 1).value != "失败原因"
+                or saved_fuel.cell(header, width + 2).value != "关联发票号"):
+            raise RuntimeError("输入工作簿加油标注列缺失")
+        by_position = {(result["source"], result["row"]): result for result in results}
+        for result in results:
+            sheet = check[result["source"]]
+            row_number = result["row"]
+            if result["source"] == fuel_source:
+                if (sheet.cell(row_number, width + 1).value != (result["failure_reason"] or None)
+                        or sheet.cell(row_number, width + 2).value != (result["invoice_number"] if result["counterpart"] else None)):
+                    raise RuntimeError("输入工作簿加油标注内容错误")
+                color = YELLOW if result.get("payment_type") == "记账卡" else RED if result["red"] else None
+            else:
+                color = RED if not result["counterpart"] else None
+            if color and any(sheet.cell(row_number, column).fill.fgColor.rgb != color
+                             for column in range(1, sheet.max_column + 1)):
+                raise RuntimeError("输入工作簿异常行标色错误")
+        for original_sheet in original:
+            saved_sheet = check[original_sheet.title]
+            if saved_sheet.max_column != original_sheet.max_column + (2 if original_sheet.title == fuel_source else 0):
+                raise RuntimeError("输入工作簿原始列数发生变化")
+            for row in original_sheet.iter_rows():
+                for cell in row:
+                    saved = saved_sheet[cell.coordinate]
+                    if saved.value != cell.value:
+                        raise RuntimeError(f"输入工作簿原始字段发生变化：{original_sheet.title}!{cell.coordinate}")
+                    original_note = (cell.comment.text, cell.comment.author) if cell.comment else None
+                    saved_note = (saved.comment.text, saved.comment.author) if saved.comment else None
+                    if original_note != saved_note:
+                        raise RuntimeError("输入工作簿原始批注发生变化")
+                    result = by_position.get((original_sheet.title, cell.row))
+                    marked = result and ((original_sheet.title == fuel_source and (result["red"] or result.get("payment_type") == "记账卡"))
+                                         or (original_sheet.title == invoice_source and not result["counterpart"]))
+                    if not marked and copy(saved.fill) != copy(cell.fill):
+                        raise RuntimeError("输入工作簿无关底色发生变化")
+    finally:
+        check.close()
+        original.close()
+        result_workbook.close()
+
+
+def _reserve_input_backup(input_path):
+    stem = f"{input_path.stem}_核对前备份_{datetime.now():%Y%m%d%H%M%S}"
+    suffix = 1
+    while True:
+        backup = input_path.with_name(stem + ("" if suffix == 1 else f"_{suffix}") + input_path.suffix)
+        try:
+            with backup.open("xb") as target, input_path.open("rb") as source:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+            return backup
+        except FileExistsError:
+            suffix += 1
+        except BaseException:
+            backup.unlink(missing_ok=True)
+            raise
 
 
 def _reserve_output_pair(directory, base_name):
@@ -1127,8 +1408,9 @@ def _write_log(path, input_path, report):
         if report["invoice_audit_path"]:
             stream.write(f"发票审核单：{report['invoice_audit_path']}\n已过滤无效发票：{report['filtered_invoice_count']}笔\n")
         stream.write(f"加油记录：{report['total_fuel']}；发票记录：{report['total_invoice']}；对应：{report['paired']}对；已匹配：{report['matched']}对\n")
-        stream.write(f"加油明细新增失败原因列，异常标记：{report['red_fuel']}行；付款类型为记账卡的行用黄色区分；发票页新增备注交易时间列\n")
-        stream.write(f"交易金额已扣优惠，直接比较发票金额；加油量与发票数量完全一致；发票交易时间减加油明细交易时间在0—{report['minutes_tolerance']}分钟内。以下仅记录匹配失败的记录。\n")
+        stream.write(f"输入工作簿：{report['annotated_input_path']}；核对前备份：{report['input_backup_path']}\n")
+        stream.write(f"加油明细新增失败原因和关联发票号列，异常标记：{report['red_fuel']}行；记账卡行用黄色区分；未配对发票标红：{report['red_invoice']}行\n")
+        stream.write("交易金额已扣优惠，直接比较发票金额；加油量与发票数量完全一致；不限制结束时间晚于开始时间的间隔，提前不超过10分钟视为正常。以下仅记录匹配失败的记录。\n")
         for result in report["results"]:
             if result["status"] == "已匹配":
                 continue
@@ -1158,7 +1440,7 @@ def _remove_old_logs(output_dir, input_name, current_log):
 
 
 def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_tolerance="0",
-                       minutes_tolerance="60", red_only=False, progress: Callable[[str], None] | None = None,
+                       red_only=False, progress: Callable[[str], None] | None = None,
                        start_text=None, end_text=None, worker_count=20,
                        match_progress: Callable[[int, int, int], None] | None = None,
                        selected_stations=None, workflow_progress: Callable[[str, int], None] | None = None,
@@ -1180,9 +1462,6 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
     amount_limit = decimal_value(amount_tolerance, "金额容差")
     if amount_limit != 0:
         raise ReconciliationError("当前方案要求金额完全一致，不能设置非零金额容差")
-    minutes_limit = decimal_value(minutes_tolerance, "时间容差")
-    if amount_limit < 0 or minutes_limit < 0 or minutes_limit > 525600:
-        raise ReconciliationError("容差不得为负，时间容差不得大于525600分钟")
     period = parse_period(date_text, start_text, end_text)
     notify("正在读取工作簿，识别加油及发票表头…")
     try:
@@ -1191,10 +1470,14 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         raise ReconciliationError(f"无法读取工作簿，请确认文件未损坏或加密：{exc}") from exc
     values_wb = None
     temporary_path = None
+    temporary_source_path = None
     reserved_path = None
     temporary_log_path = None
     reserved_log_path = None
     try:
+        load_source_sheetnames = list(wb.sheetnames)
+        old_station_sheets = set(_generated_station_names(wb))
+        _restore_annotations(wb)
         configurations, kinds, sources = [], {}, {}
         located = _locate_sheets(wb)
         if any(cell.data_type == "f" for ws, _, _ in located.values() for cell in ws._cells.values()):
@@ -1254,12 +1537,12 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
             for r in fuel + invoices:
                 if r.in_scope and not r.station:
                     r.issues.append("涉及多个油站但该记录未提供油站，需人工确认，不跨站推断")
-        notify(f"已读取加油{len(fuel)}笔、发票{len(invoices)}笔，正在按时间顺序一对一核对…")
-        results, paired = _match(fuel, invoices, amount_limit, minutes_limit * 60, worker_count, match_progress)
+        notify(f"已读取加油{len(fuel)}笔、发票{len(invoices)}笔，正在一对一核对并检查唯一金额交叉配对…")
+        results, paired = _match(fuel, invoices, amount_limit, worker_count, match_progress)
         _mark_duplicate_invoice_reasons(invoices, results)
         for result in results:
             if result["source"] == sources["invoice"]:
-                result["red"] = False
+                result["red"] = not result["counterpart"]
         source_order = {ws.title: i for i, ws in enumerate(wb.worksheets)}
         results.sort(key=lambda r: (source_order[r["source"]], r["row"]))
         positions = {(r["source"], r["row"]) for r in results}
@@ -1270,6 +1553,10 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         counterparts = [r["counterpart"] for r in fuel_results if r["counterpart"]]
         if len(counterparts) != len(set(counterparts)):
             raise RuntimeError("发票重复使用校验失败")
+        fuel_sheet_number = wb.worksheets.index(wb[sources["fuel"]]) + 1
+        preserve_limits = {fuel_sheet_number: wb[sources["fuel"]].max_column}
+        excluded_sheets = tuple(index + 1 for index, name in enumerate(load_source_sheetnames)
+                                if name == ANNOTATION_SHEET or name in old_station_sheets)
         output_dir.mkdir(parents=True, exist_ok=True)
         base_name = f"{input_path.stem}_核对结果_{datetime.now():%Y%m%d%H%M}"
         reserved_path, reserved_log_path = _reserve_output_pair(output_dir, base_name)
@@ -1283,14 +1570,30 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         invoice_insert_column, station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet = _export(
             wb, configurations, results, temporary_path, red_only, sources["invoice"], station_sheets, period, invoices)
         invoice_sheet_number = wb.worksheets.index(wb[sources["invoice"]]) + 1
-        _preserve_cell_values(input_path, temporary_path, invoice_sheet_number, invoice_insert_column)
+        _preserve_cell_values(input_path, temporary_path, invoice_sheet_number, invoice_insert_column,
+                              column_limits=preserve_limits, excluded_sheet_numbers=excluded_sheets)
         if workflow_progress:
             workflow_progress("正在检查结果工作簿…", 90)
         notify("正在回读检查原始字段、失败原因、发票交易时间及加油行标色…")
         _verify_saved(temporary_path, input_path, configurations, results, sources["invoice"], invoice_insert_column,
                       station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet)
+        with tempfile.NamedTemporaryFile(dir=input_path.parent, prefix=".加华标注中_", suffix=".xlsx", delete=False) as handle:
+            temporary_source_path = Path(handle.name)
+        source_wb = load_workbook(input_path, data_only=False)
+        try:
+            _restore_annotations(source_wb)
+            _annotate_source(source_wb, results, sources["fuel"], sources["invoice"], station_sheets, wb)
+            source_wb.save(temporary_source_path)
+        finally:
+            source_wb.close()
+        _preserve_cell_values(input_path, temporary_source_path, column_limits=preserve_limits,
+                              excluded_sheet_numbers=excluded_sheets)
+        _verify_annotated_source(temporary_source_path, input_path, temporary_path, results,
+                                 sources["fuel"], sources["invoice"], station_sheets)
         counts = dict(Counter(r["status"] for r in fuel_results))
+        backup_path = _reserve_input_backup(input_path)
         report = dict(output_path=str(reserved_path), log_path=str(reserved_log_path),
+                      annotated_input_path=str(input_path), input_backup_path=str(backup_path),
                       total_fuel=len(fuel), total_invoice=len(invoices), filtered_invoice_count=filtered_invoice_count,
                       invoice_audit_path=str(invoice_audit_path) if invoice_audit_path else "", paired=paired,
                       matched=sum(r["status"].startswith("已匹配") for r in fuel_results),
@@ -1300,7 +1603,7 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
                       expected_total=_plain(sum((r.amount for r in fuel if r.in_scope and r.amount is not None), Decimal(0))),
                       actual_total=_plain(sum((r.amount for r in invoices if r.in_scope and r.amount is not None), Decimal(0))),
                       date=period.label, period_start=_format_time(period.start), period_end=_format_time(period.end),
-                      amount_tolerance=_plain(amount_limit), minutes_tolerance=_plain(minutes_limit),
+                      amount_tolerance=_plain(amount_limit),
                       selected_stations=chosen_stations, station_sheets=station_sheets,
                       success_sheet=success_sheet, failure_sheet=failure_sheet,
                       unpaired_invoice_sheet=unpaired_invoice_sheet)
@@ -1316,18 +1619,21 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         _replace_file(temporary_path, reserved_path)
         temporary_path = None
         _replace_file(temporary_log_path, reserved_log_path)
+        temporary_log_path = None
+        _replace_file(temporary_source_path, input_path)
+        temporary_source_path = None
         current_log = reserved_log_path
-        temporary_log_path = reserved_path = reserved_log_path = None
+        reserved_path = reserved_log_path = None
         report["deleted_old_logs"], failed_logs = _remove_old_logs(output_dir, input_path.stem, current_log)
         report["log_cleanup_warning"] = "以下旧日志未能删除，请关闭占用后手动处理：" + "、".join(failed_logs) if failed_logs else ""
         notify(f"完成：对应{paired}对，成功匹配{report['matched']}对，加油异常{report['red_fuel']}笔。")
         return report
     except PermissionError as exc:
-        raise ReconciliationError("无法保存结果，请关闭已打开的输出文件，或选择可写入的输出目录") from exc
+        raise ReconciliationError("无法保存核对结果或标注原文件，请关闭已打开的输入、输出 Excel，并确认目录可写") from exc
     finally:
         if values_wb:
             values_wb.close()
         wb.close()
-        for path in (temporary_path, reserved_path, temporary_log_path, reserved_log_path):
+        for path in (temporary_path, temporary_source_path, reserved_path, temporary_log_path, reserved_log_path):
             if path is not None:
                 path.unlink(missing_ok=True)
