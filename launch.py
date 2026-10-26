@@ -42,7 +42,7 @@ def _write_progress(text: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="加华油站小助手；无参数启动桌面界面。")
     parser.add_argument("--input", help="包含加油和发票记录的 xlsx 工作簿，按表头识别工作表")
-    parser.add_argument("--invoice-audit", help="发票审核单 xlsx 原文件；过滤其中被红冲或无效的发票")
+    parser.add_argument("--invoice-audit", help="可选额外发票审核单；默认读取输入工作簿中的发票切页")
     parser.add_argument("--output-dir", help="输出目录，默认程序所在目录下的 outputs")
     parser.add_argument("--date", help="兼容单日 YYYY-MM-DD；传入空字符串核对全部；不与 --start/--end 混用")
     parser.add_argument("--start", help="开始日期或时间 YYYY-MM-DD [HH:MM[:SS]]；与 --end 配合使用")

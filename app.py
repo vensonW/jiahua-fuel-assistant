@@ -26,21 +26,21 @@ STATUSES = (
 )
 HELP_TEXT = """加华油站小助手使用说明
 
-1. 分别选择包含加油、发票数据的工作簿和发票审核单（选择 invoiceList_*.xlsx 原文件，不选 ~$ 开头的临时文件）。输入工作簿会自动备份后直接标注；审核单中被红冲或作废的发票不参与配对和标色。工具按表头识别切页，优先使用带“资料区间”的发票页。发票备注中的站点会出现在“审核站点”，支持多选和全选；仅核对勾选站点。
+1. 选择包含加油、发票数据的工作簿即可；工具直接读取其中发票切页的红蓝票信息，冲红票保留在对应油站切页并标红，但不参与配对。开始核对前若源工作簿仍在 Excel/WPS 中打开，工具会立即提醒，点击确定后退出；关闭工作簿并重新启动后再试。输入工作簿会自动备份后直接标注。工具按表头识别切页，优先使用带“资料区间”的发票页。发票备注中的站点会出现在“审核站点”，支持多选和全选；仅核对勾选站点。
 
-2. 选择工作簿后，开始、结束日期自动设为加油明细“交易时间”的最早、最晚日期；也可自由选择其他日期。可勾选“指定时刻”选择时、分、秒；仅选日期时，开始取当天 00:00:00，结束包含当天全部时间。点击“全部加油日期”可恢复默认范围。所选时间段没有可核对记录时会提示。
+2. 选择工作簿后，开始日期自动设为加油明细“交易时间”的最早日期，截止时间默认为最晚日期的 23:59:59；也可自由选择其他日期。可勾选“指定时刻”选择时、分、秒；仅选日期时，开始取当天 00:00:00，结束包含当天全部时间。点击“全部加油日期”可恢复默认范围。所选时间段没有可核对记录时会提示。
 
 3. 界面“加油明细切页-交易时间”取自加油原表，“发票-交易时间”取自发票备注；“开票时间”另行展示。发票交易时间晚于加油明细交易时间不限间隔；早于开始时间不超过 10 分钟也视为正常，超过 10 分钟则显示“时间先后异常”。
 
-4. 加油表“交易金额”已扣除优惠，直接与发票“合计金额（含税）”按原始数值严格比较，不再重复扣减优惠。加油量与发票数量也必须完全一致；优惠金额仅供查看，不参与核对。
+4. 加油表“交易金额”已扣除优惠，直接与发票“合计金额（含税）”按原始数值严格比较，不再重复扣减优惠。非手工开票（含开票方式空白）金额不一致时不配对，按找不到对应记录标注；手工开票仍可保留金额不符的疑似对应。加油量与发票数量也必须完全一致；优惠金额仅供查看，不参与核对。
 
 5. 同站同枪同油品同升数的重复候选默认按时间顺序配对；仅在加油后60分钟内金额对应唯一、两侧均无歧义且不减少配对数时，自动纠正交叉配对并注明依据。其余情况保持原顺序；每笔记录只使用一次，重复票号、同票多行或其他证据不足的情况标为待确认。
 
-6. 金额只要有差异，即使相差 0.01 元，也判为“金额不符”。付款类型为“记账卡”时，加油行仍标浅黄底；其他加油失败行和未配对发票在原发票切页及油站切页均标浅红底。加油明细末尾新增“失败原因”“关联发票号”，找不到对应发票时票号留空。
+6. 手工开票金额有差异（即使相差 0.01 元）时标“金额不符”；非手工开票金额不符时直接视为找不到对应记录。付款类型为“记账卡”时，加油行仍标浅黄底；其他加油失败行标浅红底。未配对发票在原发票切页和油站切页标浅黄底，红蓝对冲票标浅红底。红票备注指向的蓝票若不在本表，新增“红冲配对结果”切页展示缺失票号。操作员 999/9999 不享受免核对，照常标注。加油明细末尾新增“失败原因”“关联发票号”，找不到对应发票时票号留空；金额和时间均吻合且候选唯一的手工发票仅在失败原因提示疑似票号，不自动配对。
 
 7. 备注缺少结束时间时，允许使用开票时间辅助判断并注明来源，日志和预览中的加油结束时间保持空白；备注时间存在但格式无效时标为待确认。备注交易时间、油枪号及时间来源在日志和预览中展示。
 
-8. 点击“打开已标注原文件”直接查看输入工作簿，其中新增所选油站切页，未配对发票整行标红；同目录生成避重名的核对前备份。结果工作簿仍另存到输出目录，保留所选站点及“匹配成功”“匹配失败”“发票未配对”切页，并在发票原切页“备注”右侧新增“交易时间”。结果工作簿可从输出目录打开。重复核对已标注原文件会刷新旧标注和油站切页，不重复添加列；时间段外记录不新增标注。
+8. 点击“打开已标注原文件”查看加油、发票原切页的标注；油站切页只保存在结果工作簿，可点击“打开结果工作簿”查看。未配对发票在原发票页和结果工作簿的油站页整行标黄；两张原切页标签仅显示本次已匹配的记录数和加油交易金额。同目录生成避重名的核对前备份。结果工作簿另存到输出目录，保留所选站点及“匹配成功”“匹配失败”“发票未配对”切页，并在发票原切页“备注”右侧新增“交易时间”。重复核对已标注原文件会刷新旧标注和标题，并移除旧版写入源文件的油站切页；时间段外记录不新增标注。
 
 9. 与结果工作簿同名的 .log 文件保存在输出目录的 logs 文件夹，只保存匹配失败的记录，包括对应位置、金额差、升数差、时间差、失败原因和配对依据。新核对成功后，删除同一输入文件的旧核对日志，保留其他文件。成功记录在“匹配成功”切页中按每对显示，包含油枪号、加油量、油品、加油时间、发票号码等信息。双击预览行可查看完整内容。
 
@@ -72,10 +72,6 @@ def load_last_input_path() -> str:
     return _load_last_path("last_input_path")
 
 
-def load_last_invoice_audit_path() -> str:
-    return _load_last_path("last_invoice_audit_path")
-
-
 def _save_last_path(key: str, path: str) -> None:
     try:
         destination = settings_path()
@@ -94,10 +90,6 @@ def _save_last_path(key: str, path: str) -> None:
 
 def save_last_input_path(path: str) -> None:
     _save_last_path("last_input_path", path)
-
-
-def save_last_invoice_audit_path(path: str) -> None:
-    _save_last_path("last_invoice_audit_path", path)
 
 
 def application_asset_path(filename: str) -> Path:
@@ -143,6 +135,8 @@ class DateTimePicker(tk.Toplevel):
         set_window_icon(self)
         current = variable.get()
         chosen = datetime.fromisoformat(current) if current else datetime.combine(date.today(), datetime.min.time())
+        if label == "结束时间" and (not current or " " not in current):
+            chosen = chosen.replace(hour=23, minute=59, second=59)
         selected_day = chosen.date()
         self.selected_date = selected_day
         self.year = tk.StringVar(value=str(selected_day.year))
@@ -248,7 +242,6 @@ class ReconciliationApp:
         root.minsize(1000, 720)
         self.base_directory = application_directory()
         self.input_path = tk.StringVar(value=load_last_input_path())
-        self.invoice_audit_path = tk.StringVar(value=load_last_invoice_audit_path())
         self.output_directory = tk.StringVar(value=str(self.base_directory / "outputs"))
         self.start_text = tk.StringVar()
         self.end_text = tk.StringVar()
@@ -347,8 +340,7 @@ class ReconciliationApp:
         form.columnconfigure(1, weight=1)
         for row, label, variable, chooser in (
             (0, "数据工作簿", self.input_path, self._choose_input),
-            (1, "发票审核单", self.invoice_audit_path, self._choose_invoice_audit),
-            (2, "输出目录", self.output_directory, self._choose_output),
+            (1, "输出目录", self.output_directory, self._choose_output),
         ):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
             entry = ttk.Entry(form, textvariable=variable)
@@ -356,9 +348,9 @@ class ReconciliationApp:
             button = ttk.Button(form, text="浏览…", command=chooser)
             button.grid(row=row, column=2, padx=(8, 0), pady=5)
             self.setting_controls.extend((entry, button))
-        ttk.Label(form, text="核对时间段").grid(row=3, column=0, sticky="nw", padx=(0, 12), pady=5)
+        ttk.Label(form, text="核对时间段").grid(row=2, column=0, sticky="nw", padx=(0, 12), pady=5)
         options = ttk.Frame(form)
-        options.grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
+        options.grid(row=2, column=1, columnspan=2, sticky="ew", pady=5)
         for column, label, variable in ((0, "开始时间", self.start_text), (2, "结束时间", self.end_text)):
             ttk.Label(options, text=label).grid(row=0, column=column, sticky="w", padx=(0 if column == 0 else 20, 8))
             display = tk.StringVar(value=f"{variable.get() or '不限'}  ▾")
@@ -375,13 +367,13 @@ class ReconciliationApp:
         self.all_time_button.grid(row=1, column=3, sticky="e", pady=(6, 0))
         self.setting_controls.append(self.all_time_button)
         workers = ttk.Frame(form)
-        workers.grid(row=4, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        workers.grid(row=3, column=1, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Label(workers, text="并发工作数").pack(side="left", padx=(0, 8))
         self.worker_combo = ttk.Combobox(workers, textvariable=self.worker_count, values=tuple(str(count) for count in range(1, 33)), state="readonly", width=5)
         self.worker_combo.pack(side="left")
         self.setting_controls.append(self.worker_combo)
         station_frame = ttk.Frame(form)
-        station_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        station_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ttk.Label(station_frame, text="审核站点").pack(side="left", padx=(0, 12))
         select_all = ttk.Button(station_frame, text="全选", command=lambda: self._set_all_stations(True))
         select_all.pack(side="left")
@@ -390,7 +382,7 @@ class ReconciliationApp:
         self.setting_controls.extend((select_all, clear_all))
         ttk.Label(station_frame, textvariable=self.station_text).pack(side="left")
         station_box = ttk.Frame(form)
-        station_box.grid(row=6, column=0, columnspan=3, sticky="ew")
+        station_box.grid(row=5, column=0, columnspan=3, sticky="ew")
         self.station_canvas = tk.Canvas(station_box, height=54, background="#FFFFFF", highlightthickness=1, highlightbackground="#D7E3F0")
         self.station_canvas.pack(side="left", fill="x", expand=True)
         station_scroll = ttk.Scrollbar(station_box, orient="vertical", command=self.station_canvas.yview)
@@ -400,18 +392,20 @@ class ReconciliationApp:
         self.station_canvas.create_window((0, 0), window=self.station_items, anchor="nw")
         self.station_items.bind("<Configure>", lambda _event: self.station_canvas.configure(scrollregion=self.station_canvas.bbox("all")))
         actions = ttk.Frame(form)
-        actions.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 4))
         self.run_button = ttk.Button(actions, text="开始核对", command=self._start_run, style="Primary.TButton")
         self.run_button.pack(side="left")
         self.open_button = ttk.Button(actions, text="打开已标注原文件", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(8, 0))
+        self.result_button = ttk.Button(actions, text="打开结果工作簿", command=self._open_result_workbook, state="disabled")
+        self.result_button.pack(side="left", padx=(8, 0))
         self.log_button = ttk.Button(actions, text="打开核对日志", command=self._open_log, state="disabled")
         self.log_button.pack(side="left", padx=(8, 0))
         self.folder_button = ttk.Button(actions, text="打开输出目录", command=self._open_output)
         self.folder_button.pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="使用帮助", command=self._show_help).pack(side="right")
         progress_row = ttk.Frame(form)
-        progress_row.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(4, 2))
+        progress_row.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 2))
         ttk.Label(progress_row, textvariable=self.progress_text).pack(side="left", padx=(0, 12))
         self.progress = ttk.Progressbar(progress_row, mode="determinate", maximum=1)
         self.progress.pack(side="left", fill="x", expand=True)
@@ -430,7 +424,7 @@ class ReconciliationApp:
         footer.pack(side="bottom", fill="x", pady=(8, 0))
         status_label = ttk.Label(footer, textvariable=self.status_text, wraplength=1040, style="Page.TLabel")
         status_label.pack(anchor="w", fill="x")
-        ttk.Label(footer, text="原文件自动备份后直接标注；新增油站切页，未配对发票在原页和油站页标红。", style="Footer.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(footer, text="原文件自动备份后直接标注；油站切页在结果工作簿，未配对发票在原页和结果油站页标黄。", style="Footer.TLabel").pack(anchor="w", pady=(4, 0))
         footer.bind("<Configure>", lambda event: status_label.configure(wraplength=max(1, event.width)))
 
         pages = ttk.Notebook(outer)
@@ -500,7 +494,7 @@ class ReconciliationApp:
 
     def _clear_period(self) -> None:
         self.start_text.set(self.fuel_date_range[0] if self.fuel_date_range else "")
-        self.end_text.set(self.fuel_date_range[1] if self.fuel_date_range else "")
+        self.end_text.set(f"{self.fuel_date_range[1]} 23:59:59" if self.fuel_date_range else "")
 
     def _set_date_controls_enabled(self, enabled: bool) -> None:
         for button in (*self.time_buttons, self.all_time_button):
@@ -512,18 +506,6 @@ class ReconciliationApp:
         if selected:
             self.input_path.set(selected)
             save_last_input_path(selected)
-
-    def _choose_invoice_audit(self) -> None:
-        current = Path(self.invoice_audit_path.get()).expanduser()
-        source = Path(self.input_path.get()).expanduser()
-        initial = current.parent if current.is_file() else source.parent if source.is_file() else self.base_directory
-        selected = filedialog.askopenfilename(parent=self.root, title="选择发票审核单原文件", initialdir=str(initial), filetypes=(("Excel 工作簿", "*.xlsx"),))
-        if selected:
-            if Path(selected).name.startswith("~$"):
-                messagebox.showerror("设置有误", "请选择发票审核单原文件，不要选择以 ~$ 开头的 Excel 临时锁定文件。", parent=self.root)
-                return
-            self.invoice_audit_path.set(selected)
-            save_last_invoice_audit_path(selected)
 
     def _schedule_station_scan(self, *_args) -> None:
         self.station_scan_id += 1
@@ -590,7 +572,6 @@ class ReconciliationApp:
         # Read every Tk variable on the UI thread before starting background work.
         parameters = {
             "input_path": self.input_path.get().strip(),
-            "invoice_audit_path": self.invoice_audit_path.get().strip(),
             "output_dir": self.output_directory.get().strip(),
             "date_text": "",
             "start_text": self.start_text.get().strip(),
@@ -604,13 +585,13 @@ class ReconciliationApp:
                 raise ValueError("请选择存在的数据工作簿。")
             if source.suffix.lower() != ".xlsx":
                 raise ValueError("请选择 .xlsx 格式的 Excel 工作簿。")
-            audit = Path(parameters["invoice_audit_path"])
-            if not parameters["invoice_audit_path"] or not audit.is_file() or audit.suffix.lower() != ".xlsx":
-                raise ValueError("请选择存在的 .xlsx 发票审核单。")
-            if audit.name.startswith("~$"):
-                raise ValueError("请选择发票审核单原文件，不要选择以 ~$ 开头的 Excel 临时锁定文件。")
-            if audit.resolve() == source.resolve():
-                raise ValueError("发票审核单与数据工作簿不能是同一个文件。")
+            from reconciliation import ReconciliationError, check_input_file_available
+            try:
+                check_input_file_available(source)
+            except ReconciliationError as exc:
+                messagebox.showwarning("请关闭源文件", str(exc), parent=self.root)
+                self._close()
+                return
             if not parameters["output_dir"]:
                 raise ValueError("请填写输出目录。")
             if self.station_path != parameters["input_path"]:
@@ -630,13 +611,13 @@ class ReconciliationApp:
             messagebox.showerror("设置有误", str(exc), parent=self.root)
             return
         save_last_input_path(parameters["input_path"])
-        save_last_invoice_audit_path(parameters["invoice_audit_path"])
         self.busy = True
         self.output_path = None
         self.annotated_input_path = None
         self.input_backup_path = None
         self.log_path = None
         self.open_button.configure(state="disabled")
+        self.result_button.configure(state="disabled")
         self.log_button.configure(state="disabled")
         self.run_button.configure(state="disabled")
         self.folder_button.configure(state="disabled")
@@ -681,7 +662,7 @@ class ReconciliationApp:
                         self.fuel_date_range = fuel_range if not error else None
                         if fuel_range:
                             self.start_text.set(fuel_range[0])
-                            self.end_text.set(fuel_range[1])
+                            self.end_text.set(f"{fuel_range[1]} 23:59:59")
                         self._set_date_controls_enabled(bool(fuel_range) and not self.busy)
                         date_text = f"，加油日期 {fuel_range[0]} 至 {fuel_range[1]}" if fuel_range else ""
                         interval_text = f"，发票资料区间 {interval[0]} 至 {interval[1]}" if interval else ""
@@ -712,11 +693,24 @@ class ReconciliationApp:
                     self.progress_text.set(f"核对进度：{payload['total_fuel']}/{payload['total_fuel']}（完成）")
                     self._update_status_options()
                     self.open_button.configure(state="normal")
+                    self.result_button.configure(state="normal")
                     self.log_button.configure(state="normal")
+                    phases = payload.get("phase_seconds", {})
+                    phase_summary = (f"\n分段耗时：结果生成 {phases['result_build']:.2f} 秒、结果校验 {phases['result_verify']:.2f} 秒、"
+                                     f"源文件标注 {phases['source_annotation']:.2f} 秒、"
+                                     f"源文件校验 {phases['source_verify']:.2f} 秒。"
+                                     if all(key in phases for key in ("result_build", "result_verify", "source_annotation",
+                                                                       "source_verify")) else "")
+                    verify_keys = ("result_verify_input_load", "result_verify_output_load", "result_verify_checks",
+                                   "source_verify_annotated_load", "source_verify_original_load", "source_verify_checks")
+                    if all(key in phases for key in verify_keys):
+                        phase_summary += (f"\n校验拆分：结果加载原件 {phases['result_verify_input_load']:.2f}、加载结果 {phases['result_verify_output_load']:.2f}、检查 {phases['result_verify_checks']:.2f} 秒；"
+                                          f"源文件加载标注件 {phases['source_verify_annotated_load']:.2f}、加载原件 {phases['source_verify_original_load']:.2f}、检查 {phases['source_verify_checks']:.2f} 秒。")
                     self.summary_text.set(
                         f"加油记录 {payload['total_fuel']} 条　发票记录 {payload['total_invoice']} 条　对应 {payload['paired']} 对　"
-                        f"已匹配 {payload['matched']} 对，其余需核查　已过滤无效发票 {payload.get('filtered_invoice_count', 0)} 条　核对耗时：{payload['elapsed_text']}\n"
+                        f"已匹配 {payload['matched']} 对，其余需核查　不参与配对的无效发票 {payload.get('filtered_invoice_count', 0)} 条，红蓝对冲标红 {payload.get('void_invoice_count', 0)} 行　核对耗时：{payload['elapsed_text']}\n"
                         f"原文件已标注：加油异常 {payload['red_fuel']} 条，未配对发票 {payload['red_invoice']} 条；记账卡仍标黄。"
+                        f"{phase_summary}"
                     )
                     status = f"已标注原文件：{self.annotated_input_path}\n核对前备份：{self.input_backup_path}\n结果工作簿：{self.output_path}\n核对日志：{self.log_path}"
                     if payload.get("log_cleanup_warning"):
@@ -796,7 +790,7 @@ class ReconciliationApp:
 
     def _open_counterpart(self, event) -> None:
         if self._is_counterpart_cell(event):
-            self._open_result()
+            self._open_result_workbook()
 
     def _show_row_details(self, event=None) -> None:
         if event is not None and self._is_counterpart_cell(event):
@@ -843,6 +837,13 @@ class ReconciliationApp:
                 self._open_path(self.annotated_input_path)
             else:
                 messagebox.showerror("原文件不存在", f"已标注原文件可能已被移动或删除：\n{self.annotated_input_path}", parent=self.root)
+
+    def _open_result_workbook(self) -> None:
+        if self.output_path is not None:
+            if self.output_path.is_file():
+                self._open_path(self.output_path)
+            else:
+                messagebox.showerror("结果工作簿不存在", f"结果工作簿可能已被移动或删除：\n{self.output_path}", parent=self.root)
 
     def _open_log(self) -> None:
         if self.log_path is not None:

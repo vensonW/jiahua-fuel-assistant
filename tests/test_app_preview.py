@@ -121,15 +121,15 @@ class AppPreviewTests(unittest.TestCase):
 
     def test_counterpart_cell_opens_result_workbook(self):
         self.app._refresh_preview()
-        self.app._open_result = Mock()
+        self.app._open_result_workbook = Mock()
         self.app._open_counterpart(SimpleNamespace(x=3, y=2))
-        self.app._open_result.assert_called_once_with()
+        self.app._open_result_workbook.assert_called_once_with()
 
         self.app._open_counterpart(SimpleNamespace(x=2, y=2))
-        self.app._open_result.assert_called_once_with()
+        self.app._open_result_workbook.assert_called_once_with()
 
         self.app._open_counterpart(SimpleNamespace(widget=self.app.success_table, x=3, y=0))
-        self.assertEqual(self.app._open_result.call_count, 2)
+        self.assertEqual(self.app._open_result_workbook.call_count, 2)
 
 
 if __name__ == "__main__":

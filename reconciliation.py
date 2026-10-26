@@ -44,11 +44,35 @@ INVOICE_ALIASES = {
     "electronic": ["数电票号码", "电子发票号码"], "number": ["发票号码"],
     "flag": ["红票标志"], "invoice_status": ["开票状态"],
     "station": ["油站名称", "加油站名称", "开票门店", "部门门店"],
+    "opening_method": ["开票方式"],
 }
 
 
 class ReconciliationError(ValueError):
     """A problem with the user's workbook or settings."""
+
+
+def check_input_file_available(path):
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(str(Path(path).resolve()), 0xC0000000, 0, None, 3, 0, None)
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in (5, 32, 33):
+            raise ReconciliationError("源文件已被 Excel/WPS 打开或不可写，请先关闭该工作簿，再点击开始核对。")
+        raise OSError(error, "无法检查源文件是否可写", str(path))
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
 
 
 def _replace_file(source, target):
@@ -94,7 +118,10 @@ def parse_period(date_text="2026-10-11", start_text=None, end_text=None) -> Peri
         try:
             if len(text) == 10:
                 return datetime.combine(date.fromisoformat(text), time.max if is_end else time.min)
-            return datetime.fromisoformat(text)
+            parsed = datetime.fromisoformat(text)
+            if is_end and parsed.time() == time(23, 59, 59):
+                return parsed.replace(microsecond=999999)
+            return parsed
         except ValueError as exc:
             raise ReconciliationError("开始/结束时间不是有效的日期时间") from exc
 
@@ -130,6 +157,7 @@ class Record:
     reference_row: int = 0
     payment_type: str = ""
     remark: str = ""
+    opening_method: str = ""
 
 
 def decimal_value(value, label: str, *, blank_zero=False) -> Decimal:
@@ -188,6 +216,10 @@ def normalize_station(value) -> str:
     text = re.sub(r"\s+", "", str(value or ""))
     # The supplied invoice remarks add the GAWA brand before the station name.
     return re.sub(r"^(?:中南加华|加华)", "", text)
+
+
+def _hint_station_key(value):
+    return normalize_station(value).replace("加油站", "油站")
 
 
 def _identifier(value) -> str:
@@ -255,7 +287,8 @@ def _locate_sheets(workbook):
         if len(options) > 1:
             preferred = [item for item in options if kind == "invoice" and _invoice_interval_text(item[0], item[1])]
             if len(preferred) != 1:
-                preferred = [item for item in options if item[0].title == ("加油明细记录" if kind == "fuel" else "发票")]
+                preferred = [item for item in options if item[0].title == ("加油明细记录" if kind == "fuel" else "发票")
+                             or item[0].title.startswith("加油明细记录" if kind == "fuel" else "发票记录")]
             if len(preferred) != 1:
                 raise ReconciliationError(f"找到多个{('加油明细' if kind == 'fuel' else '发票')}工作表，无法确定审核切页")
             options = preferred
@@ -303,7 +336,27 @@ def _restore_annotations(workbook):
     return True
 
 
-def _annotate_source(workbook, results, fuel_source, invoice_source, station_sheets, result_workbook):
+def _source_failure_reasons(results, fuel_source, invoice_source):
+    escaped_fuel = fuel_source.replace("'", "''")
+    paired_invoices = {result["counterpart"]: result for result in results
+                       if result["kind"] == "invoice" and result["counterpart"]}
+    reasons = {}
+    for result in results:
+        if result["kind"] != "fuel" or not result["counterpart"] or not result["failure_reason"]:
+            continue
+        invoice = paired_invoices[f"'{escaped_fuel}'!A{result['row']}"]
+        reference_source = invoice.get("reference_source") or invoice_source
+        reference_row = invoice.get("reference_row") or invoice["row"]
+        station_location = f"对应发票切页“{reference_source}”第{reference_row}行"
+        original_location = f"对应发票切页“{invoice_source}”第{invoice['row']}行"
+        if station_location not in result["failure_reason"]:
+            raise RuntimeError("原文件发票位置转换失败")
+        reasons[result["row"]] = result["failure_reason"].replace(station_location, original_location, 1)
+    return reasons
+
+
+def _annotate_source(workbook, results, fuel_source, invoice_source, reversal_sheet,
+                     result_workbook, void_invoice_rows, source_reasons, phase_seconds=None):
     fuel_ws, fuel_header, _ = _locate_sheets(workbook)["fuel"]
     invoice_ws, invoice_header, _ = _locate_sheets(workbook)["invoice"]
     original_fuel_columns = fuel_ws.max_column
@@ -314,7 +367,9 @@ def _annotate_source(workbook, results, fuel_source, invoice_source, station_she
         cell._style = copy(fuel_ws.cell(fuel_header, original_fuel_columns)._style)
     fuel_ws.column_dimensions[get_column_letter(reason_column)].width = 78
     fuel_ws.column_dimensions[get_column_letter(number_column)].width = 28
-    for sheet_name in station_sheets.values():
+    generated_sheets = [reversal_sheet] if reversal_sheet else []
+    copy_started = clock_time.perf_counter()
+    for sheet_name in generated_sheets:
         original = result_workbook[sheet_name]
         copied = workbook.create_sheet(sheet_name)
         for row_number in range(1, original.max_row + 1):
@@ -323,10 +378,12 @@ def _annotate_source(workbook, results, fuel_source, invoice_source, station_she
             copied.column_dimensions[column].width = dimension.width
         copied.freeze_panes = original.freeze_panes
         copied.auto_filter.ref = original.auto_filter.ref
+    if phase_seconds is not None:
+        phase_seconds["reversal_sheet_copy"] = round(clock_time.perf_counter() - copy_started, 2)
     metadata = workbook.create_sheet(ANNOTATION_SHEET)
     metadata["A1"] = ANNOTATION_MARKER
-    metadata["E1"] = len(station_sheets)
-    for index, sheet_name in enumerate(station_sheets.values(), 2):
+    metadata["E1"] = len(generated_sheets)
+    for index, sheet_name in enumerate(generated_sheets, 2):
         metadata.cell(index, 4, sheet_name)
     metadata.sheet_state = "veryHidden"
     next_row = 2
@@ -344,7 +401,7 @@ def _annotate_source(workbook, results, fuel_source, invoice_source, station_she
     for result in results:
         if result["source"] == fuel_source:
             row_number = result["row"]
-            fuel_ws.cell(row_number, reason_column, result["failure_reason"] or None)
+            fuel_ws.cell(row_number, reason_column, source_reasons.get(row_number, result["failure_reason"]) or None)
             fuel_ws.cell(row_number, number_column, result["invoice_number"] if result["counterpart"] else None)
             fill = PatternFill("solid", fgColor=YELLOW if result.get("payment_type") == "记账卡" else RED) if result["red"] or result.get("payment_type") == "记账卡" else None
             if fill is not None:
@@ -352,7 +409,9 @@ def _annotate_source(workbook, results, fuel_source, invoice_source, station_she
                 fuel_ws.cell(row_number, reason_column).fill = copy(fill)
                 fuel_ws.cell(row_number, number_column).fill = copy(fill)
         elif result["source"] == invoice_source and not result["counterpart"]:
-            mark(invoice_ws, result["row"], invoice_ws.max_column, PatternFill("solid", fgColor=RED))
+            mark(invoice_ws, result["row"], invoice_ws.max_column, PatternFill("solid", fgColor=YELLOW))
+    for row_number in sorted(void_invoice_rows):
+        mark(invoice_ws, row_number, invoice_ws.max_column, PatternFill("solid", fgColor=RED))
     fuel_ws.auto_filter.ref = f"A{fuel_header}:{get_column_letter(number_column)}{fuel_ws.max_row}"
     if not invoice_ws.auto_filter.ref:
         invoice_ws.auto_filter.ref = f"A{invoice_header}:{get_column_letter(invoice_ws.max_column)}{invoice_ws.max_row}"
@@ -413,7 +472,7 @@ def scan_invoice_stations(input_path):
     return scan_invoice_metadata(input_path)[0]
 
 
-def scan_voided_invoice_numbers(input_path):
+def _scan_voided_invoice_records(input_path):
     input_path = Path(input_path).expanduser()
     if input_path.name.startswith("~$"):
         raise ReconciliationError("请选择发票审核单原文件，不要选择以 ~$ 开头的 Excel 临时锁定文件")
@@ -425,34 +484,67 @@ def scan_voided_invoice_numbers(input_path):
         raise ReconciliationError(f"无法读取发票审核单，请确认文件未损坏或加密：{exc}") from exc
     try:
         candidates = []
+        generated_sheets = set(_generated_station_names(workbook))
         for ws in workbook.worksheets:
+            if ws.title == ANNOTATION_SHEET or ws.title in generated_sheets:
+                continue
             ws.reset_dimensions()
             found = _find_header(ws, (("invoice", INVOICE_ALIASES, ["time", "remark"]),))
             if found and ("electronic" in found[2] or "number" in found[2]):
                 candidates.append((ws, found[1], found[2]))
+        if len(candidates) > 1:
+            preferred = [candidate for candidate in candidates if _invoice_interval_text(candidate[0], candidate[1])]
+            if len(preferred) != 1:
+                preferred = [candidate for candidate in candidates
+                             if candidate[0].title == "发票" or candidate[0].title.startswith("发票记录")]
+            if len(preferred) == 1:
+                candidates = preferred
         if len(candidates) != 1:
             raise ReconciliationError("发票审核单中未找到唯一的发票切页，请检查开票时间、发票号码和备注表头")
         ws, header, mapping = candidates[0]
         columns = [mapping["remark"], mapping.get("electronic", 0), mapping.get("number", 0),
-                   mapping.get("flag", 0), mapping.get("invoice_status", 0)]
+                   mapping.get("flag", 0), mapping.get("invoice_status", 0), mapping.get("amount", 0)]
         invalid_numbers = set()
-        for row in ws.iter_rows(min_row=header + 1, max_col=max(columns), values_only=True):
+        invoice_rows = []
+        for row_number, row in enumerate(ws.iter_rows(min_row=header + 1, max_col=max(columns), values_only=True), header + 1):
             remark = str(row[mapping["remark"] - 1] or "")
             reversed_invoice = re.search(r"被红冲.{0,30}?发票号码\s*[:：]\s*['’]?\s*(\d{8,30})", remark)
             if reversed_invoice:
                 invalid_numbers.add(reversed_invoice.group(1))
             flag = str(row[mapping["flag"] - 1] or "") if "flag" in mapping else ""
             status = str(row[mapping["invoice_status"] - 1] or "") if "invoice_status" in mapping else ""
-            if "红" in flag or any(word in status for word in ("作废", "红冲", "失败")):
-                value = row[mapping["electronic"] - 1] if "electronic" in mapping else None
-                if not value and "number" in mapping:
-                    value = row[mapping["number"] - 1]
-                number = _invoice_number_key(value)
-                if number:
-                    invalid_numbers.add(number)
-        return invalid_numbers
+            value = row[mapping["electronic"] - 1] if "electronic" in mapping else None
+            if not value and "number" in mapping:
+                value = row[mapping["number"] - 1]
+            number = _invoice_number_key(value)
+            is_void = "红" in flag or any(word in status for word in ("作废", "红冲", "失败"))
+            if is_void and number:
+                invalid_numbers.add(number)
+            amount = row[mapping["amount"] - 1] if "amount" in mapping else None
+            invoice_rows.append((row_number, number, is_void, amount,
+                                 reversed_invoice.group(1) if reversed_invoice else ""))
+        void_rows = {row_number for row_number, number, is_void, _, _ in invoice_rows
+                     if is_void or number in invalid_numbers and number}
+        blue_by_number = defaultdict(list)
+        for row_number, number, is_void, amount, _ in invoice_rows:
+            if number and not is_void:
+                blue_by_number[number].append((row_number, amount))
+        reversals = []
+        for row_number, number, is_void, amount, blue_number in invoice_rows:
+            if not is_void or not blue_number:
+                continue
+            matches = blue_by_number[blue_number]
+            reversals.append((row_number, number, amount, blue_number,
+                              matches[0][0] if len(matches) == 1 else None,
+                              matches[0][1] if len(matches) == 1 else None,
+                              "蓝票不在本表" if not matches else "已配对" if len(matches) == 1 else "蓝票重复，需核查"))
+        return invalid_numbers, void_rows, reversals
     finally:
         workbook.close()
+
+
+def scan_voided_invoice_numbers(input_path):
+    return _scan_voided_invoice_records(input_path)[0]
 
 
 def _blank(value):
@@ -496,6 +588,7 @@ def _read_records(ws, values_ws, header, mapping, kind, period):
         if kind == "fuel":
             trade = number("trade", "交易金额")
             payment_type = "".join(str(get("payment_type") or "").split())
+            opening_method = ""
             if "discount" in mapping:
                 try:
                     discount = decimal_value(get("discount"), "优惠金额", blank_zero=True)
@@ -510,6 +603,7 @@ def _read_records(ws, values_ws, header, mapping, kind, period):
                 notes.append("卡号缺失")
         else:
             payment_type = ""
+            opening_method = "".join(str(get("opening_method") or "").split())
             amount = number("amount", "发票合计金额（含税）")
             remark = str(get("remark") or "")
             invoice_time = parse_time(get("time"))
@@ -548,7 +642,7 @@ def _read_records(ws, values_ws, header, mapping, kind, period):
         records.append(Record(ws.title, row, kind, record_time, gun, oil, volume, amount,
                               invoice_number, time_source, issues, notes, in_scope,
                               station, card, trade, discount, end_time, invoice_time,
-                              payment_type=payment_type, remark=remark))
+                              payment_type=payment_type, remark=remark, opening_method=opening_method))
     return records
 
 
@@ -567,6 +661,8 @@ def _edge_type(a, b, amount_limit):
     if not _compatible(a, b):
         return None
     amount_ok = abs(b.amount - a.amount) <= amount_limit
+    if not amount_ok and "手工开票" not in b.opening_method:
+        return None
     volume_ok = b.volume == a.volume
     strong_identity = bool(a.gun and b.gun and a.oil and b.oil)
     if volume_ok and strong_identity:
@@ -804,7 +900,8 @@ def _pair_result(a, b, amount_limit, duplicate=False, crossed=False):
                   trade_amount=_plain(a.trade), discount_amount=_plain(a.discount),
                   red=status != "已匹配" or amount_diff != 0)
     return [dict(common, kind="fuel", source=a.source, row=a.row, counterpart=f"'{invoice_source}'!A{invoice_row}", invoice_number=b.number),
-            dict(common, kind="invoice", source=b.source, row=b.row, counterpart=f"'{a.source}'!A{a.row}", invoice_number=b.number)]
+            dict(common, kind="invoice", source=b.source, row=b.row, counterpart=f"'{a.source}'!A{a.row}",
+                 reference_source=b.reference_source, reference_row=b.reference_row, invoice_number=b.number)]
 
 
 def _unpaired_result(record):
@@ -914,6 +1011,49 @@ def _mark_duplicate_invoice_reasons(invoices, results):
         result["basis"] = reason + ("；" + "；".join(record.notes) if record.notes else "")
 
 
+def _suggest_unpaired_invoices(fuel, invoices, results):
+    unmatched_fuel = {result["row"]: result for result in results
+                      if result["kind"] == "fuel" and not result["counterpart"]}
+    unmatched_invoices = {result["row"] for result in results
+                          if result["kind"] == "invoice" and not result["counterpart"]}
+    grouped_invoices = defaultdict(list)
+    for record in invoices:
+        if (record.row in unmatched_invoices and not record.issues and record.time is not None
+                and record.amount is not None and record.number and record.station):
+            grouped_invoices[(record.amount, _hint_station_key(record.station))].append(record)
+    indexed_invoices = {}
+    for key, group in grouped_invoices.items():
+        ordered = sorted(group, key=lambda record: (record.time, record.row))
+        indexed_invoices[key] = ([record.time for record in ordered], ordered)
+    candidates = defaultdict(list)
+    invoice_counts = Counter()
+    for fuel_record in fuel:
+        if (fuel_record.row not in unmatched_fuel or fuel_record.issues or fuel_record.time is None
+                or fuel_record.amount is None or not fuel_record.station):
+            continue
+        times, records = indexed_invoices.get((fuel_record.amount, _hint_station_key(fuel_record.station)), ([], []))
+        first = bisect_left(times, fuel_record.time - timedelta(minutes=10))
+        last = bisect_right(times, fuel_record.time + timedelta(minutes=60))
+        for invoice_record in records[first:last]:
+            if (fuel_record.oil and invoice_record.oil and fuel_record.oil != invoice_record.oil
+                    or fuel_record.volume is not None and invoice_record.volume is not None
+                    and fuel_record.volume != invoice_record.volume
+                    or fuel_record.gun and invoice_record.gun and fuel_record.gun != invoice_record.gun):
+                continue
+            candidates[fuel_record.row].append(invoice_record)
+            invoice_counts[invoice_record.row] += 1
+    for row_number, matches in candidates.items():
+        if len(matches) != 1 or invoice_counts[matches[0].row] != 1:
+            continue
+        invoice_record = matches[0]
+        hint = (f"按金额和时间疑似找到发票号{invoice_record.number}"
+                f"（发票原切页第{invoice_record.row}行，{invoice_record.time_source}："
+                f"{_format_time(invoice_record.time)}）；需人工核对，未自动配对")
+        result = unmatched_fuel[row_number]
+        result["failure_reason"] += "；" + hint
+        result["basis"] += "；" + hint
+
+
 def _unique_sheet_name(workbook, requested):
     base = re.sub(r"[\\/*?:\[\]]", "_", requested).strip()[:31] or "站点"
     name, suffix = base, 2
@@ -922,6 +1062,41 @@ def _unique_sheet_name(workbook, requested):
         name = base[:31 - len(ending)] + ending
         suffix += 1
     return name
+
+
+def _record_sheet_title(workbook, sheet, kind, count, amount):
+    label, unit = ("加油明细记录", "笔") if kind == "fuel" else ("发票记录", "张")
+    suffix = f"{count}{unit}{amount:.2f}元"
+    if len(suffix) >= 31:
+        raise ReconciliationError("记录条数或金额过大，无法写入 Excel 切页标题")
+    requested = label[:31 - len(suffix)] + suffix
+    if sheet.title == requested:
+        return requested
+    return _unique_sheet_name(workbook, requested)
+
+
+def _apply_source_sheet_titles(workbook, title_map):
+    for previous, current in title_map.items():
+        if previous != current:
+            workbook[previous].title = current
+
+
+def _rename_result_sources(results, title_map):
+    for result in results:
+        result["source"] = title_map.get(result["source"], result["source"])
+        if result.get("reference_source"):
+            result["reference_source"] = title_map.get(result["reference_source"], result["reference_source"])
+        for key in ("counterpart", "match_details", "failure_reason", "basis"):
+            value = result.get(key)
+            if not value:
+                continue
+            for previous, current in title_map.items():
+                if previous != current:
+                    old_reference = "'" + previous.replace("'", "''") + "'!"
+                    new_reference = "'" + current.replace("'", "''") + "'!"
+                    value = value.replace(old_reference, new_reference)
+                    value = value.replace(f"“{previous}”", f"“{current}”")
+            result[key] = value
 
 
 def _copy_row(source, target, source_row, target_row, source_columns, column_offset=0):
@@ -946,7 +1121,8 @@ def _ordered_station_invoices(records, station):
                   key=lambda record: (record.invoice_time is None, record.invoice_time or datetime.max, record.row))
 
 
-def _add_result_sheets(workbook, invoice_ws, header, records, results, station_sheets, period):
+def _add_result_sheets(workbook, invoice_ws, header, records, results, station_sheets, period,
+                       void_invoice_rows):
     end = period.end.replace(microsecond=0) if period.end and period.end.time() == time.max else period.end
     invoice_columns = invoice_ws.max_column
     interval = _invoice_interval_text(invoice_ws, header)
@@ -963,9 +1139,10 @@ def _add_result_sheets(workbook, invoice_ws, header, records, results, station_s
         selected = _ordered_station_invoices(records, station)
         for target_row, record in enumerate(selected, 3):
             _copy_row(invoice_ws, sheet, record.row, target_row, invoice_columns)
-            if (sheet_name, target_row) in unpaired_rows:
+            if (sheet_name, target_row) in unpaired_rows or record.row in void_invoice_rows:
+                fill = PatternFill("solid", fgColor=RED if record.row in void_invoice_rows else YELLOW)
                 for column in range(1, invoice_columns + 1):
-                    sheet.cell(target_row, column).fill = PatternFill("solid", fgColor=RED)
+                    sheet.cell(target_row, column).fill = copy(fill)
         sheet.freeze_panes = "A3"
         sheet.auto_filter.ref = f"A2:{get_column_letter(invoice_columns)}{max(2, len(selected) + 2)}"
     sheet = workbook.create_sheet(_unique_sheet_name(workbook, "匹配成功"))
@@ -1054,12 +1231,53 @@ def _add_result_sheets(workbook, invoice_ws, header, records, results, station_s
         unpaired_sheet.cell(target_row, 3, result["status"])
         reason = unpaired_sheet.cell(target_row, 4, result["failure_reason"])
         reason.alignment = Alignment(vertical="center", wrap_text=True)
+        for cell in unpaired_sheet[target_row]:
+            cell.fill = PatternFill("solid", fgColor=YELLOW)
     unpaired_sheet.freeze_panes = "A3"
     unpaired_sheet.auto_filter.ref = f"A2:{get_column_letter(invoice_columns + len(metadata))}{max(2, unpaired_sheet.max_row)}"
     return station_sheets, success_sheet, failure.title, unpaired_sheet.title
 
 
-def _export(wb, configurations, results, path, red_only, invoice_source, station_sheets, period, selected_invoices):
+def _add_reversal_sheet(workbook, invoice_source, reversals):
+    if not any(record[6] != "已配对" for record in reversals):
+        return None
+    sheet = workbook.create_sheet(_unique_sheet_name(workbook, "红冲配对结果"))
+    sheet["A1"] = "红冲（红字→蓝票）配对结果汇总"
+    for row_number, label, value in ((3, "红票记录", len(reversals)),
+                                     (4, "已配对", sum(record[6] == "已配对" for record in reversals)),
+                                     (5, "蓝票不在本表", sum(record[6] == "蓝票不在本表" for record in reversals)),
+                                     (6, "需核查", sum(record[6] == "蓝票重复，需核查" for record in reversals))):
+        sheet.cell(row_number, 1, label)
+        sheet.cell(row_number, 2, value)
+    headers = ("序号", "红票行号", "红票数电票号码", "红票金额（含税）", "对应蓝票数电票号码",
+               "蓝票行号", "蓝票金额（含税）", "匹配状态")
+    for column, label in enumerate(headers, 1):
+        sheet.cell(9, column, label)
+    red_fill = PatternFill("solid", fgColor=RED)
+    yellow_fill = PatternFill("solid", fgColor=YELLOW)
+    escaped_source = invoice_source.replace("'", "''")
+    for target_row, (red_row, red_number, red_amount, blue_number, blue_row, blue_amount, status) in enumerate(reversals, 10):
+        for column, value in enumerate((target_row - 9, red_row, red_number, red_amount, blue_number,
+                                         blue_row, blue_amount, status), 1):
+            sheet.cell(target_row, column, value)
+        for column, source_row in ((2, red_row), (6, blue_row)):
+            if source_row:
+                cell = sheet.cell(target_row, column)
+                cell.hyperlink = Hyperlink(ref=cell.coordinate, location=f"'{escaped_source}'!A{source_row}")
+        if status != "已配对":
+            fill = red_fill if status == "蓝票不在本表" else yellow_fill
+            for column in range(1, len(headers) + 1):
+                sheet.cell(target_row, column).fill = copy(fill)
+    sheet.freeze_panes = "A10"
+    sheet.auto_filter.ref = f"A9:H{max(9, sheet.max_row)}"
+    for column, width in zip("ABCDEFGH", (10, 15, 28, 19, 28, 15, 19, 22)):
+        sheet.column_dimensions[column].width = width
+    return sheet.title
+
+
+def _export(wb, configurations, results, path, red_only, invoice_source, station_sheets, period, selected_invoices,
+            void_invoice_rows, reversals, phase_seconds=None, workflow_progress=None):
+    build_started = clock_time.perf_counter()
     by_source = defaultdict(list)
     for result in results:
         by_source[result["source"]].append(result)
@@ -1085,7 +1303,10 @@ def _export(wb, configurations, results, path, red_only, invoice_source, station
             for result in by_source[ws.title]:
                 if not result["counterpart"]:
                     for cell in ws[result["row"]][:original_columns + 1]:
-                        cell.fill = copy(red_fill)
+                        cell.fill = copy(yellow_fill)
+            for row_number in void_invoice_rows:
+                for cell in ws[row_number][:original_columns + 1]:
+                    cell.fill = copy(red_fill)
             if ws.auto_filter.ref:
                 min_column, min_row, max_column, max_row = range_boundaries(ws.auto_filter.ref)
                 if max_column >= invoice_insert_column:
@@ -1122,11 +1343,20 @@ def _export(wb, configurations, results, path, red_only, invoice_source, station
         if red_only and not any(result["red"] and result.get("payment_type") == "记账卡" for result in by_source[ws.title]):
             dxf_id = wb._differential_styles.add(DifferentialStyle(fill=red_fill))
             ws.auto_filter.filterColumn.append(FilterColumn(colId=0, colorFilter=ColorFilter(dxfId=dxf_id, cellColor=True)))
+    reversal_sheet = _add_reversal_sheet(wb, invoice_source, reversals)
     invoice_config = next(config for config in configurations if config[0].title == invoice_source)
     station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet = _add_result_sheets(
-        wb, invoice_config[0], invoice_config[1], selected_invoices, results, station_sheets, period)
+        wb, invoice_config[0], invoice_config[1], selected_invoices, results, station_sheets, period,
+        void_invoice_rows)
+    if phase_seconds is not None:
+        phase_seconds["result_build"] = round(clock_time.perf_counter() - build_started, 2)
+    if workflow_progress:
+        workflow_progress("正在保存结果工作簿…", 85)
+    save_started = clock_time.perf_counter()
     wb.save(path)
-    return invoice_insert_column, station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet
+    if phase_seconds is not None:
+        phase_seconds["result_save"] = round(clock_time.perf_counter() - save_started, 2)
+    return invoice_insert_column, station_sheets, reversal_sheet, success_sheet, failure_sheet, unpaired_invoice_sheet
 
 
 def _preserve_cell_values(original, output, invoice_sheet_number=None, invoice_insert_column=None,
@@ -1200,16 +1430,54 @@ def _preserve_cell_values(original, output, invoice_sheet_number=None, invoice_i
         staged.unlink(missing_ok=True)
 
 
-def _verify_saved(path, original_path, configurations, results, invoice_source, invoice_insert_column,
-                  station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet):
+def _same_fill(first, second, cache):
+    first_style = first._style.fillId if first._style else 0
+    second_style = second._style.fillId if second._style else 0
+    key = (id(first.parent.parent), first_style, id(second.parent.parent), second_style)
+    if key not in cache:
+        cache[key] = copy(first.fill) == copy(second.fill)
+    return cache[key]
+
+
+def _reversal_snapshot(sheet):
+    return ((sheet.max_row, sheet.max_column, sheet.auto_filter.ref),
+            tuple(tuple((cell.value, copy(cell.fill)) for cell in row) for row in sheet))
+
+
+def _verify_saved(path, original, configurations, results, invoice_source, invoice_insert_column,
+                  station_sheets, reversal_sheet, success_sheet, failure_sheet, unpaired_invoice_sheet,
+                  void_invoice_rows, reversals, display_invoices, phase_seconds=None):
+    load_started = clock_time.perf_counter()
     check = load_workbook(path, data_only=False)
-    original = load_workbook(original_path, data_only=False)
+    if phase_seconds is not None:
+        phase_seconds["result_verify_output_load"] = round(clock_time.perf_counter() - load_started, 2)
+    checks_started = clock_time.perf_counter()
+    fill_cache = {}
     try:
-        _restore_annotations(original)
         if check.sheetnames[:len(original.sheetnames)] != original.sheetnames:
             raise RuntimeError("输出工作表结构发生变化")
-        if check.sheetnames[len(original.sheetnames):] != [*station_sheets.values(), success_sheet, failure_sheet, unpaired_invoice_sheet]:
+        if check.sheetnames[len(original.sheetnames):] != [*station_sheets.values(),
+                                                          *([reversal_sheet] if reversal_sheet else []),
+                                                          success_sheet, failure_sheet, unpaired_invoice_sheet]:
             raise RuntimeError("新增工作表结构发生变化")
+        for station, sheet_name in station_sheets.items():
+            selected = _ordered_station_invoices(display_invoices, station)
+            sheet = check[sheet_name]
+            if sheet.max_row != max(2, len(selected) + 2):
+                raise RuntimeError("油站切页发票记录不完整")
+            for row_number, record in enumerate(selected, 3):
+                if (record.reference_source, record.reference_row) != (sheet_name, row_number):
+                    raise RuntimeError("油站切页发票行号错误")
+                if record.row in void_invoice_rows and any(sheet.cell(row_number, column).fill.fgColor.rgb != RED
+                                                           for column in range(1, sheet.max_column + 1)):
+                    raise RuntimeError("油站切页冲红发票未标红")
+        if reversal_sheet:
+            sheet = check[reversal_sheet]
+            if sheet.max_row != len(reversals) + 9:
+                raise RuntimeError("红冲配对结果记录不完整")
+            for row_number, reversal in enumerate(reversals, 10):
+                if [sheet.cell(row_number, column).value for column in range(2, 9)] != list(reversal):
+                    raise RuntimeError("红冲配对结果内容错误")
         if check[failure_sheet].max_row != 2 + sum(result["kind"] == "fuel" and result["status"] != "已匹配" for result in results):
             raise RuntimeError("匹配失败工作表记录不完整")
         expected_unpaired = Counter()
@@ -1224,8 +1492,15 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
             actual_unpaired[(cell.value, cell.hyperlink.location if cell.hyperlink else "")] += 1
         if actual_unpaired != expected_unpaired:
             raise RuntimeError("发票未配对工作表记录不完整")
+        for row_number in range(3, check[unpaired_invoice_sheet].max_row + 1):
+            if any(cell.fill.fgColor.rgb != YELLOW for cell in check[unpaired_invoice_sheet][row_number]):
+                raise RuntimeError("发票未配对工作表标色错误")
         unpaired_positions = {(result["source"], result["row"]) for result in results
                               if result["kind"] == "invoice" and not result["counterpart"]}
+        for row_number in void_invoice_rows:
+            if any(check[invoice_source].cell(row_number, column).fill.fgColor.rgb != RED
+                   for column in range(1, check[invoice_source].max_column + 1)):
+                raise RuntimeError("红蓝对冲发票整行标色校验失败")
         config_by_name = {ws.title: (header, original_columns, records) for ws, header, original_columns, records in configurations}
         for result in results:
             header, original_columns, _ = config_by_name[result["source"]]
@@ -1233,7 +1508,7 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
             is_invoice = result["source"] == invoice_source
             if is_invoice and not result["counterpart"] and result.get("reference_source") in station_sheets.values():
                 station_ws = check[result["reference_source"]]
-                if any(station_ws.cell(result["reference_row"], column).fill.fgColor.rgb != RED
+                if any(station_ws.cell(result["reference_row"], column).fill.fgColor.rgb != YELLOW
                        for column in range(1, station_ws.max_column + 1)):
                     raise RuntimeError("油站切页未配对发票整行标色校验失败")
             if not is_invoice:
@@ -1244,7 +1519,7 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
                 raise RuntimeError("加油明细失败原因写入错误")
             if not is_invoice and ws.cell(result["row"], original_columns + 2).value != (result["invoice_number"] if result["counterpart"] else None):
                 raise RuntimeError("加油明细关联发票号写入错误")
-            if is_invoice and not result["counterpart"] and any(ws.cell(result["row"], c).fill.fgColor.rgb != RED for c in range(1, original_columns + 2)):
+            if is_invoice and not result["counterpart"] and any(ws.cell(result["row"], c).fill.fgColor.rgb != YELLOW for c in range(1, original_columns + 2)):
                 raise RuntimeError("未配对发票整行标色校验失败")
         for configured_ws, header, original_columns, records in configurations:
             source_ws = original[configured_ws.title]
@@ -1275,35 +1550,50 @@ def _verify_saved(path, original_path, configurations, results, invoice_source, 
                     saved_note = (saved.comment.text, saved.comment.author) if saved.comment else None
                     if original_note != saved_note:
                         raise RuntimeError("原表批注发生变化")
-                    if is_invoice and (source_ws.title, cell.row) not in unpaired_positions and copy(saved.fill) != copy(cell.fill):
+                    if is_invoice and (source_ws.title, cell.row) not in unpaired_positions and cell.row not in void_invoice_rows and not _same_fill(saved, cell, fill_cache):
                         raise RuntimeError("发票原有标色发生变化")
+        snapshot = _reversal_snapshot(check[reversal_sheet]) if reversal_sheet else None
+        if phase_seconds is not None:
+            phase_seconds["result_verify_checks"] = round(clock_time.perf_counter() - checks_started, 2)
+        return snapshot
     finally:
         check.close()
-        original.close()
 
 
-def _verify_annotated_source(path, original_path, result_path, results, fuel_source, invoice_source, station_sheets):
+def _verify_annotated_source(path, original_path, reversal_snapshot, results, fuel_source, invoice_source,
+                             reversal_sheet, void_invoice_rows, source_titles, source_reasons, phase_seconds=None):
+    load_started = clock_time.perf_counter()
     check = load_workbook(path, data_only=False)
+    if phase_seconds is not None:
+        phase_seconds["source_verify_annotated_load"] = round(clock_time.perf_counter() - load_started, 2)
+    load_started = clock_time.perf_counter()
     original = load_workbook(original_path, data_only=False)
-    result_workbook = load_workbook(result_path, data_only=False)
+    if phase_seconds is not None:
+        phase_seconds["source_verify_original_load"] = round(clock_time.perf_counter() - load_started, 2)
+    checks_started = clock_time.perf_counter()
+    fill_cache = {}
     try:
         _restore_annotations(original)
-        if check.sheetnames != [*original.sheetnames, *station_sheets.values(), ANNOTATION_SHEET]:
+        _apply_source_sheet_titles(original, source_titles)
+        generated_sheets = [reversal_sheet] if reversal_sheet else []
+        if check.sheetnames != [*original.sheetnames, *generated_sheets, ANNOTATION_SHEET]:
             raise RuntimeError("输入工作簿的工作表结构发生变化")
         if check[ANNOTATION_SHEET]["A1"].value != ANNOTATION_MARKER or check[ANNOTATION_SHEET].sheet_state != "veryHidden":
             raise RuntimeError("输入工作簿标色记录缺失")
-        if _generated_station_names(check) != list(station_sheets.values()):
-            raise RuntimeError("输入工作簿油站切页记录不完整")
-        for sheet_name in station_sheets.values():
+        if _generated_station_names(check) != generated_sheets:
+            raise RuntimeError("输入工作簿红冲配对结果切页记录不完整")
+        for sheet_name in generated_sheets:
             saved_sheet = check[sheet_name]
-            output_sheet = result_workbook[sheet_name]
-            if (saved_sheet.max_row, saved_sheet.max_column, saved_sheet.auto_filter.ref) != (output_sheet.max_row, output_sheet.max_column, output_sheet.auto_filter.ref):
-                raise RuntimeError("输入工作簿油站切页结构错误")
-            for row in output_sheet:
-                for cell in row:
-                    saved_cell = saved_sheet[cell.coordinate]
-                    if saved_cell.value != cell.value or copy(saved_cell.fill) != copy(cell.fill):
-                        raise RuntimeError(f"输入工作簿油站切页内容或标色错误：{sheet_name}!{cell.coordinate}")
+            if reversal_snapshot is None:
+                raise RuntimeError("结果工作簿红冲配对结果校验数据缺失")
+            expected_structure, expected_rows = reversal_snapshot
+            if (saved_sheet.max_row, saved_sheet.max_column, saved_sheet.auto_filter.ref) != expected_structure:
+                raise RuntimeError("输入工作簿红冲配对结果切页结构错误")
+            for row_number, expected_row in enumerate(expected_rows, 1):
+                for column_number, (expected_value, expected_fill) in enumerate(expected_row, 1):
+                    saved_cell = saved_sheet.cell(row_number, column_number)
+                    if saved_cell.value != expected_value or copy(saved_cell.fill) != expected_fill:
+                        raise RuntimeError(f"输入工作簿红冲配对结果切页内容或标色错误：{sheet_name}!{saved_cell.coordinate}")
         fuel_ws, header, _ = _locate_sheets(original)["fuel"]
         width = fuel_ws.max_column
         saved_fuel = check[fuel_source]
@@ -1311,16 +1601,20 @@ def _verify_annotated_source(path, original_path, result_path, results, fuel_sou
                 or saved_fuel.cell(header, width + 2).value != "关联发票号"):
             raise RuntimeError("输入工作簿加油标注列缺失")
         by_position = {(result["source"], result["row"]): result for result in results}
+        for row_number in void_invoice_rows:
+            if any(check[invoice_source].cell(row_number, column).fill.fgColor.rgb != RED
+                   for column in range(1, check[invoice_source].max_column + 1)):
+                raise RuntimeError("输入工作簿红蓝对冲发票标色错误")
         for result in results:
             sheet = check[result["source"]]
             row_number = result["row"]
             if result["source"] == fuel_source:
-                if (sheet.cell(row_number, width + 1).value != (result["failure_reason"] or None)
+                if (sheet.cell(row_number, width + 1).value != (source_reasons.get(row_number, result["failure_reason"]) or None)
                         or sheet.cell(row_number, width + 2).value != (result["invoice_number"] if result["counterpart"] else None)):
                     raise RuntimeError("输入工作簿加油标注内容错误")
                 color = YELLOW if result.get("payment_type") == "记账卡" else RED if result["red"] else None
             else:
-                color = RED if not result["counterpart"] else None
+                color = YELLOW if not result["counterpart"] else None
             if color and any(sheet.cell(row_number, column).fill.fgColor.rgb != color
                              for column in range(1, sheet.max_column + 1)):
                 raise RuntimeError("输入工作簿异常行标色错误")
@@ -1338,14 +1632,16 @@ def _verify_annotated_source(path, original_path, result_path, results, fuel_sou
                     if original_note != saved_note:
                         raise RuntimeError("输入工作簿原始批注发生变化")
                     result = by_position.get((original_sheet.title, cell.row))
-                    marked = result and ((original_sheet.title == fuel_source and (result["red"] or result.get("payment_type") == "记账卡"))
-                                         or (original_sheet.title == invoice_source and not result["counterpart"]))
-                    if not marked and copy(saved.fill) != copy(cell.fill):
+                    marked = original_sheet.title == invoice_source and cell.row in void_invoice_rows or result and (
+                        (original_sheet.title == fuel_source and (result["red"] or result.get("payment_type") == "记账卡"))
+                        or (original_sheet.title == invoice_source and not result["counterpart"]))
+                    if not marked and not _same_fill(saved, cell, fill_cache):
                         raise RuntimeError("输入工作簿无关底色发生变化")
+        if phase_seconds is not None:
+            phase_seconds["source_verify_checks"] = round(clock_time.perf_counter() - checks_started, 2)
     finally:
         check.close()
         original.close()
-        result_workbook.close()
 
 
 def _reserve_input_backup(input_path):
@@ -1405,11 +1701,28 @@ def _write_log(path, input_path, report):
     with Path(path).open("w", encoding="utf-8", newline="\n") as stream:
         stream.write("加华加油与发票核对日志\n")
         stream.write(f"源文件：{input_path}\n核对时间段：{report['date']}\n核对耗时：{report['elapsed_text']}\n")
+        phase_labels = (("invoice_scan", "发票扫描"), ("read_parse", "读取与解析"),
+                        ("matching", "记录配对"), ("result_build", "结果工作簿生成"),
+                        ("result_save", "结果工作簿保存"), ("result_preserve", "结果原值保留"),
+                        ("result_verify", "结果工作簿校验"),
+                        ("result_verify_input_load", "结果校验原件加载与还原"),
+                        ("result_verify_output_load", "结果校验文件加载"),
+                        ("result_verify_checks", "结果校验逐项检查"),
+                        ("reversal_sheet_copy", "红冲结果切页复制"),
+                        ("source_annotation", "源文件标注（含红冲结果切页复制）"),
+                        ("source_save", "源文件临时保存"), ("source_preserve", "源文件原值保留"),
+                        ("source_verify", "源文件校验"),
+                        ("source_verify_annotated_load", "源文件校验标注文件加载"),
+                        ("source_verify_original_load", "源文件校验原件加载"),
+                        ("source_verify_checks", "源文件校验逐项检查"),
+                        ("backup", "原文件备份"))
+        stream.write("分段耗时（秒）：" + "；".join(f"{label} {report['phase_seconds'][key]:.2f}"
+                                              for key, label in phase_labels if key in report["phase_seconds"]) + "\n")
         if report["invoice_audit_path"]:
-            stream.write(f"发票审核单：{report['invoice_audit_path']}\n已过滤无效发票：{report['filtered_invoice_count']}笔\n")
+            stream.write(f"发票数据来源：{report['invoice_audit_path']}\n不参与配对的无效发票：{report['filtered_invoice_count']}笔（保留在油站切页）\n")
         stream.write(f"加油记录：{report['total_fuel']}；发票记录：{report['total_invoice']}；对应：{report['paired']}对；已匹配：{report['matched']}对\n")
         stream.write(f"输入工作簿：{report['annotated_input_path']}；核对前备份：{report['input_backup_path']}\n")
-        stream.write(f"加油明细新增失败原因和关联发票号列，异常标记：{report['red_fuel']}行；记账卡行用黄色区分；未配对发票标红：{report['red_invoice']}行\n")
+        stream.write(f"加油明细新增失败原因和关联发票号列，异常标记：{report['red_fuel']}行；记账卡行用黄色区分；未配对发票标黄：{report['red_invoice']}行\n")
         stream.write("交易金额已扣优惠，直接比较发票金额；加油量与发票数量完全一致；不限制结束时间晚于开始时间的间隔，提前不超过10分钟视为正常。以下仅记录匹配失败的记录。\n")
         for result in report["results"]:
             if result["status"] == "已匹配":
@@ -1444,26 +1757,29 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
                        start_text=None, end_text=None, worker_count=20,
                        match_progress: Callable[[int, int, int], None] | None = None,
                        selected_stations=None, workflow_progress: Callable[[str, int], None] | None = None,
-                       invoice_audit_path=None):
+                       invoice_audit_path=None, show_sheet_totals=True):
     started_at = clock_time.perf_counter()
+    phase_seconds = {}
     notify = progress or (lambda _message: None)
     if isinstance(worker_count, bool) or not isinstance(worker_count, int) or not 1 <= worker_count <= 32:
         raise ReconciliationError("并发工作数须为 1—32 的整数")
     input_path, output_dir = Path(input_path).resolve(), Path(output_dir).resolve()
     if not input_path.is_file() or input_path.suffix.lower() != ".xlsx":
         raise ReconciliationError("请选择存在的 .xlsx 加油及发票工作簿")
-    invalid_invoice_numbers = set()
-    if invoice_audit_path:
-        invoice_audit_path = Path(invoice_audit_path).expanduser().resolve()
-        if invoice_audit_path == input_path:
-            raise ReconciliationError("发票审核单与数据工作簿不能是同一个文件")
-        notify("正在读取发票审核单，识别被红冲及无效发票…")
-        invalid_invoice_numbers = scan_voided_invoice_numbers(invoice_audit_path)
+    check_input_file_available(input_path)
+    invoice_audit_path = Path(invoice_audit_path).expanduser().resolve() if invoice_audit_path else input_path
+    notify("正在读取发票切页，识别被红冲及无效发票…")
+    phase_started = clock_time.perf_counter()
+    invalid_invoice_numbers, void_invoice_rows, reversal_records = _scan_voided_invoice_records(input_path)
+    if invoice_audit_path != input_path:
+        invalid_invoice_numbers.update(scan_voided_invoice_numbers(invoice_audit_path))
+    phase_seconds["invoice_scan"] = round(clock_time.perf_counter() - phase_started, 2)
     amount_limit = decimal_value(amount_tolerance, "金额容差")
     if amount_limit != 0:
         raise ReconciliationError("当前方案要求金额完全一致，不能设置非零金额容差")
     period = parse_period(date_text, start_text, end_text)
     notify("正在读取工作簿，识别加油及发票表头…")
+    phase_started = clock_time.perf_counter()
     try:
         wb = load_workbook(input_path, data_only=False)
     except Exception as exc:
@@ -1478,7 +1794,7 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         load_source_sheetnames = list(wb.sheetnames)
         old_station_sheets = set(_generated_station_names(wb))
         _restore_annotations(wb)
-        configurations, kinds, sources = [], {}, {}
+        configurations, kinds, sources, source_titles = [], {}, {}, {}
         located = _locate_sheets(wb)
         if any(cell.data_type == "f" for ws, _, _ in located.values() for cell in ws._cells.values()):
             notify("检测到公式，正在读取其计算缓存…")
@@ -1491,10 +1807,17 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
                 raise ReconciliationError("该文件已含核对结果，请选择原始工作簿重新核对")
             notify(f"正在解析{('加油明细' if kind == 'fuel' else '发票')}工作表：{ws.max_row - header}行…")
             records = _read_records(ws, values_wb[ws.title] if values_wb else ws, header, mapping, kind, period)
+            source_titles[ws.title] = ws.title
             kinds[kind] = records
             sources[kind] = ws.title
             configurations.append((ws, header, ws.max_column, records))
         all_fuel, all_invoices = kinds["fuel"], kinds["invoice"]
+        void_invoice_rows.update(record.row for record in all_invoices
+                                 if _invoice_number_key(record.number) in invalid_invoice_numbers)
+        invoices_by_row = {record.row: record for record in all_invoices}
+        for red_row, _, _, _, blue_row, _, _ in reversal_records:
+            if blue_row and not invoices_by_row[red_row].station:
+                invoices_by_row[red_row].station = invoices_by_row[blue_row].station
         available_stations = sorted({record.station for record in all_invoices if record.station})
         if selected_stations is None:
             chosen_stations = available_stations
@@ -1507,24 +1830,25 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
             if unknown:
                 raise ReconciliationError("所选加油站点不在发票备注中：" + "、".join(sorted(unknown)))
             chosen_stations = sorted(requested)
-            normalized = {normalize_station(name) for name in chosen_stations}
-            selected_fuel = [record for record in all_fuel if normalize_station(record.station) in normalized]
+            normalized = {_hint_station_key(name) for name in chosen_stations}
+            selected_fuel = [record for record in all_fuel if _hint_station_key(record.station) in normalized]
             selected_invoices = [record for record in all_invoices if record.station in requested]
         if not selected_fuel and not selected_invoices:
             raise ReconciliationError("所选站点没有可核对的明细记录")
         if period.start and not any(record.in_scope and record.time is not None for record in selected_fuel + selected_invoices):
             raise ReconciliationError("所选核对时间段不包含任何加油或发票记录，请检查开始、结束时间")
         fuel = [record for record in selected_fuel if record.in_scope or record.time is None]
-        invoices = [record for record in selected_invoices if record.in_scope or record.time is None]
-        original_invoice_count = len(invoices)
+        display_invoices = [record for record in selected_invoices if record.in_scope or record.time is None]
+        invoices = display_invoices
+        original_invoice_count = len(display_invoices)
         if invalid_invoice_numbers:
             invoices = [record for record in invoices if _invoice_number_key(record.number) not in invalid_invoice_numbers]
         filtered_invoice_count = original_invoice_count - len(invoices)
         if filtered_invoice_count:
-            notify(f"已过滤被红冲或无效发票 {filtered_invoice_count} 笔，不参与核对及未配对统计。")
+            notify(f"被红冲或无效发票 {filtered_invoice_count} 笔保留在油站切页并标红，不参与配对。")
         station_sheets = {station: wb.create_sheet(_unique_sheet_name(wb, station)).title for station in chosen_stations}
         for station, sheet_name in station_sheets.items():
-            station_invoices = _ordered_station_invoices(invoices, station)
+            station_invoices = _ordered_station_invoices(display_invoices, station)
             for target_row, record in enumerate(station_invoices, 3):
                 record.reference_source = sheet_name
                 record.reference_row = target_row
@@ -1538,8 +1862,24 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
                 if r.in_scope and not r.station:
                     r.issues.append("涉及多个油站但该记录未提供油站，需人工确认，不跨站推断")
         notify(f"已读取加油{len(fuel)}笔、发票{len(invoices)}笔，正在一对一核对并检查唯一金额交叉配对…")
+        phase_seconds["read_parse"] = round(clock_time.perf_counter() - phase_started, 2)
+        phase_started = clock_time.perf_counter()
         results, paired = _match(fuel, invoices, amount_limit, worker_count, match_progress)
         _mark_duplicate_invoice_reasons(invoices, results)
+        _suggest_unpaired_invoices(fuel, invoices, results)
+        phase_seconds["matching"] = round(clock_time.perf_counter() - phase_started, 2)
+        if show_sheet_totals:
+            successful = [result for result in results if result["kind"] == "fuel" and result["status"] == "已匹配"]
+            matched_amount = sum((Decimal(result["expected"]) for result in successful), Decimal(0))
+            for kind in ("fuel", "invoice"):
+                sheet = wb[sources[kind]]
+                previous_title = sheet.title
+                sheet.title = _record_sheet_title(wb, sheet, kind, len(successful), matched_amount)
+                source_titles[previous_title] = sheet.title
+                sources[kind] = sheet.title
+                for record in kinds[kind]:
+                    record.source = sheet.title
+            _rename_result_sources(results, source_titles)
         for result in results:
             if result["source"] == sources["invoice"]:
                 result["red"] = not result["counterpart"]
@@ -1550,6 +1890,7 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
             raise RuntimeError("记录结果覆盖校验失败")
         fuel_results = [r for r in results if r["source"] == sources["fuel"]]
         invoice_results = [r for r in results if r["source"] == sources["invoice"]]
+        source_reasons = _source_failure_reasons(results, sources["fuel"], sources["invoice"])
         counterparts = [r["counterpart"] for r in fuel_results if r["counterpart"]]
         if len(counterparts) != len(set(counterparts)):
             raise RuntimeError("发票重复使用校验失败")
@@ -1567,34 +1908,64 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
         if workflow_progress:
             workflow_progress("正在生成结果工作簿…", 80)
         notify("正在标记加油异常、写入失败原因，并在发票备注右侧添加交易时间…")
-        invoice_insert_column, station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet = _export(
-            wb, configurations, results, temporary_path, red_only, sources["invoice"], station_sheets, period, invoices)
+        invoice_insert_column, station_sheets, reversal_sheet, success_sheet, failure_sheet, unpaired_invoice_sheet = _export(
+            wb, configurations, results, temporary_path, red_only, sources["invoice"], station_sheets, period,
+            display_invoices,
+            void_invoice_rows, reversal_records, phase_seconds, workflow_progress)
         invoice_sheet_number = wb.worksheets.index(wb[sources["invoice"]]) + 1
+        phase_started = clock_time.perf_counter()
         _preserve_cell_values(input_path, temporary_path, invoice_sheet_number, invoice_insert_column,
                               column_limits=preserve_limits, excluded_sheet_numbers=excluded_sheets)
+        phase_seconds["result_preserve"] = round(clock_time.perf_counter() - phase_started, 2)
         if workflow_progress:
             workflow_progress("正在检查结果工作簿…", 90)
         notify("正在回读检查原始字段、失败原因、发票交易时间及加油行标色…")
-        _verify_saved(temporary_path, input_path, configurations, results, sources["invoice"], invoice_insert_column,
-                      station_sheets, success_sheet, failure_sheet, unpaired_invoice_sheet)
-        with tempfile.NamedTemporaryFile(dir=input_path.parent, prefix=".加华标注中_", suffix=".xlsx", delete=False) as handle:
-            temporary_source_path = Path(handle.name)
+        phase_started = clock_time.perf_counter()
         source_wb = load_workbook(input_path, data_only=False)
         try:
             _restore_annotations(source_wb)
-            _annotate_source(source_wb, results, sources["fuel"], sources["invoice"], station_sheets, wb)
+            _apply_source_sheet_titles(source_wb, source_titles)
+            phase_seconds["result_verify_input_load"] = round(clock_time.perf_counter() - phase_started, 2)
+            reversal_snapshot = _verify_saved(
+                temporary_path, source_wb, configurations, results, sources["invoice"], invoice_insert_column,
+                station_sheets, reversal_sheet, success_sheet, failure_sheet, unpaired_invoice_sheet,
+                void_invoice_rows, reversal_records, display_invoices, phase_seconds)
+            phase_seconds["result_verify"] = round(clock_time.perf_counter() - phase_started, 2)
+            with tempfile.NamedTemporaryFile(dir=input_path.parent, prefix=".加华标注中_", suffix=".xlsx", delete=False) as handle:
+                temporary_source_path = Path(handle.name)
+            if workflow_progress:
+                workflow_progress("正在标注加油和发票原切页…", 91)
+            phase_started = clock_time.perf_counter()
+            _annotate_source(source_wb, results, sources["fuel"], sources["invoice"], reversal_sheet, wb,
+                             void_invoice_rows, source_reasons, phase_seconds)
+            phase_seconds["source_annotation"] = round(clock_time.perf_counter() - phase_started, 2)
+            if workflow_progress:
+                workflow_progress("正在保存标注原文件…", 92)
+            phase_started = clock_time.perf_counter()
             source_wb.save(temporary_source_path)
+            phase_seconds["source_save"] = round(clock_time.perf_counter() - phase_started, 2)
         finally:
             source_wb.close()
+        phase_started = clock_time.perf_counter()
         _preserve_cell_values(input_path, temporary_source_path, column_limits=preserve_limits,
                               excluded_sheet_numbers=excluded_sheets)
-        _verify_annotated_source(temporary_source_path, input_path, temporary_path, results,
-                                 sources["fuel"], sources["invoice"], station_sheets)
+        phase_seconds["source_preserve"] = round(clock_time.perf_counter() - phase_started, 2)
+        if workflow_progress:
+            workflow_progress("正在校验标注原文件…", 94)
+        phase_started = clock_time.perf_counter()
+        _verify_annotated_source(temporary_source_path, input_path, reversal_snapshot, results,
+                                 sources["fuel"], sources["invoice"], reversal_sheet,
+                                 void_invoice_rows, source_titles, source_reasons, phase_seconds)
+        phase_seconds["source_verify"] = round(clock_time.perf_counter() - phase_started, 2)
         counts = dict(Counter(r["status"] for r in fuel_results))
+        phase_started = clock_time.perf_counter()
         backup_path = _reserve_input_backup(input_path)
+        phase_seconds["backup"] = round(clock_time.perf_counter() - phase_started, 2)
         report = dict(output_path=str(reserved_path), log_path=str(reserved_log_path),
                       annotated_input_path=str(input_path), input_backup_path=str(backup_path),
-                      total_fuel=len(fuel), total_invoice=len(invoices), filtered_invoice_count=filtered_invoice_count,
+                      total_fuel=len(fuel),
+                      total_invoice=len(invoices), filtered_invoice_count=filtered_invoice_count,
+                      void_invoice_count=len(void_invoice_rows), reversal_sheet=reversal_sheet or "",
                       invoice_audit_path=str(invoice_audit_path) if invoice_audit_path else "", paired=paired,
                       matched=sum(r["status"].startswith("已匹配") for r in fuel_results),
                       red_fuel=sum(r["red"] for r in fuel_results),
@@ -1605,6 +1976,7 @@ def run_reconciliation(input_path, output_dir, date_text="2026-10-11", amount_to
                       date=period.label, period_start=_format_time(period.start), period_end=_format_time(period.end),
                       amount_tolerance=_plain(amount_limit),
                       selected_stations=chosen_stations, station_sheets=station_sheets,
+                      source_sheet_titles=sources, phase_seconds=phase_seconds,
                       success_sheet=success_sheet, failure_sheet=failure_sheet,
                       unpaired_invoice_sheet=unpaired_invoice_sheet)
         report["elapsed_seconds"] = round(clock_time.perf_counter() - started_at, 2)

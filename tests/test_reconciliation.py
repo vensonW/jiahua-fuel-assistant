@@ -61,7 +61,7 @@ def invoice(**changes):
         "开票时间": "2026-10-11 10:00:30", "合计金额（含税）": 100,
         "备注": "交易时间：2026-10-11 10:00:00   油枪号：4", "开票状态": "开票完成",
         "商品名称": "*汽油*95#车用汽油", "单位": "升", "数量": 10,
-        "金额（含税）": 100, "开票单号": "I001", "流水号": "INV001",
+        "金额（含税）": 100, "开票单号": "I001", "开票方式": "手工开票（网页端）", "流水号": "INV001",
     }
     row.update(changes)
     return row
@@ -101,6 +101,7 @@ class ReconciliationContractTests(unittest.TestCase):
         workbook.close()
 
     def run_case(self, **options):
+        options.setdefault("show_sheet_totals", False)
         summary = run_reconciliation(self.input_path, self.output_directory, **options)
         self.assertTrue(Path(summary["output_path"]).is_file())
         self.assertEqual(Path(summary["output_path"]).parent.resolve(), self.output_directory.resolve())
@@ -113,6 +114,17 @@ class ReconciliationContractTests(unittest.TestCase):
     @staticmethod
     def fuel_results(summary):
         return [row for row in summary["results"] if str(row["source"]) in {"加油", "加油明细记录", "fuel"}]
+
+    def test_fill_comparison_cache_respects_workbook_styles(self):
+        first = Workbook()
+        second = Workbook()
+        first.active["A1"].fill = PatternFill("solid", fgColor=reconciliation.RED)
+        second.active["A1"].fill = PatternFill("solid", fgColor=reconciliation.YELLOW)
+        second.active["A2"].fill = PatternFill("solid", fgColor=reconciliation.RED)
+        cache = {}
+        self.assertFalse(reconciliation._same_fill(first.active["A1"], second.active["A1"], cache))
+        self.assertTrue(reconciliation._same_fill(first.active["A1"], second.active["A2"], cache))
+        self.assertEqual(len(cache), 2)
 
     def one_fuel_result(self, summary):
         rows = self.fuel_results(summary)
@@ -185,7 +197,8 @@ class ReconciliationContractTests(unittest.TestCase):
         self.make_workbook()
         with patch.object(reconciliation, "load_workbook", wraps=load_workbook) as loader:
             self.run_case()
-        self.assertFalse(any(call.kwargs.get("data_only") for call in loader.call_args_list))
+        self.assertFalse(any(call.kwargs.get("data_only") and not call.kwargs.get("read_only")
+                             for call in loader.call_args_list))
 
     def test_official_layout_station_selection_and_new_sheets(self):
         stations = ("加华明珠加油站", "加华南屏加油站")
@@ -269,18 +282,125 @@ class ReconciliationContractTests(unittest.TestCase):
         self.addCleanup(workbook.close)
         self.assertEqual(workbook["发票"].cell(3, INVOICE_HEADERS.index("数电票号码") + 1).value, invalid_number)
         station_sheet = workbook[summary["station_sheets"]["加华样例站"]]
-        self.assertEqual(station_sheet.max_row, 3)
-        self.assertEqual(station_sheet.cell(3, INVOICE_HEADERS.index("数电票号码") + 1).value, valid_number)
+        self.assertEqual(station_sheet.max_row, 4)
+        self.assertEqual(station_sheet.cell(3, INVOICE_HEADERS.index("数电票号码") + 1).value, invalid_number)
+        self.assert_red_row(station_sheet, 3)
+        self.assertEqual(station_sheet.cell(4, INVOICE_HEADERS.index("数电票号码") + 1).value, valid_number)
         self.assertEqual(workbook[summary["unpaired_invoice_sheet"]].max_row, 2)
         self.assertNotIn(invalid_number, Path(summary["log_path"]).read_text(encoding="utf-8"))
         annotated = load_workbook(self.input_path)
         self.addCleanup(annotated.close)
-        self.assertIsNone(annotated["发票"]["A3"].fill.fill_type)
+        self.assert_red_row(annotated["发票"], 3)
 
-    def test_invoice_audit_must_be_distinct_original_workbook(self):
+    def test_reversed_red_and_blue_remain_visible_in_station_sheet(self):
+        station = "加华样例站"
+        blue_number = "26447200000089100664"
+        red_number = "26447200000089100671"
+        self.make_workbook(invoices=[
+            invoice(数电票号码=blue_number, 备注=f"加油站点：{station} 交易时间：2026-10-11 10:00:00 油枪号：4"),
+            invoice(数电票号码=red_number, 红票标志="红票",
+                    备注=f"被红冲蓝字数电发票号码：{blue_number}"),
+            invoice(数电票号码="26447200000089100670",
+                    备注=f"加油站点：{station} 交易时间：2026-10-11 10:00:00 油枪号：4"),
+        ])
+        summary = self.run_case()
+        self.assertEqual((summary["filtered_invoice_count"], summary["matched"]), (2, 1))
+        source = load_workbook(self.input_path)
+        self.addCleanup(source.close)
+        self.assertNotIn(summary["station_sheets"][station], source.sheetnames)
+        self.assert_red_row(source["发票"], 3)
+        self.assert_red_row(source["发票"], 4)
+        workbook = load_workbook(summary["output_path"])
+        self.addCleanup(workbook.close)
+        station_sheet = workbook[summary["station_sheets"][station]]
+        self.assertEqual(station_sheet.max_row, 5)
+        self.assertEqual([station_sheet.cell(row, INVOICE_HEADERS.index("数电票号码") + 1).value
+                          for row in (3, 4, 5)], [blue_number, red_number, "26447200000089100670"])
+        self.assert_red_row(station_sheet, 3)
+        self.assert_red_row(station_sheet, 4)
+        self.assertIsNone(station_sheet["A5"].fill.fill_type)
+
+    def test_embedded_red_blue_reversal_marks_both_invoice_rows(self):
+        blue_number = "26447200000089100664"
+        red_number = "26447200000089100671"
+        valid_number = "26447200000089100670"
+        self.make_workbook(invoices=[
+            invoice(数电票号码=blue_number, 备注="加油站点：加华样例站 交易时间：2026-10-12 10:00:00 油枪号：4"),
+            invoice(数电票号码=red_number, 红票标志="红票",
+                    备注=f"被红冲蓝字数电发票号码：{blue_number}"),
+            invoice(数电票号码=valid_number),
+        ])
+        summary = self.run_case()
+        self.assertEqual((summary["filtered_invoice_count"], summary["void_invoice_count"], summary["matched"]),
+                         (1, 2, 1))
+        self.assertEqual(reconciliation.scan_voided_invoice_numbers(self.input_path), {blue_number, red_number})
+        for path in (self.input_path, Path(summary["output_path"])):
+            workbook = load_workbook(path)
+            self.assert_red_row(workbook["发票"], 3)
+            self.assert_red_row(workbook["发票"], 4)
+            self.assertIsNone(workbook["发票"]["A5"].fill.fill_type)
+            workbook.close()
+        source = load_workbook(self.input_path)
+        source["发票"].cell(4, INVOICE_HEADERS.index("备注") + 1, "红票")
+        source.save(self.input_path)
+        source.close()
+        self.run_case()
+        refreshed = load_workbook(self.input_path)
+        self.addCleanup(refreshed.close)
+        self.assertIsNone(refreshed["发票"]["A3"].fill.fill_type)
+        self.assert_red_row(refreshed["发票"], 4)
+
+    def test_missing_reversed_blue_invoice_creates_result_sheet_in_source(self):
+        missing_number = "26447200000089100664"
+        self.make_workbook(invoices=[
+            invoice(数电票号码="26447200000089100671", 红票标志="红票",
+                    备注=f"被红冲蓝字数电发票号码：{missing_number}"),
+            invoice(数电票号码="26447200000089100670"),
+        ])
+        with patch("reconciliation.load_workbook", wraps=load_workbook) as loaded:
+            summary = self.run_case()
+        result_loads = [call for call in loaded.call_args_list
+                        if Path(call.args[0]).name.startswith(".核对中_")]
+        self.assertEqual(len(result_loads), 1)
+        sheet_name = summary["reversal_sheet"]
+        self.assertEqual(sheet_name, "红冲配对结果")
+        for path in (self.input_path, Path(summary["output_path"])):
+            workbook = load_workbook(path)
+            sheet = workbook[sheet_name]
+            self.assertEqual(sheet["A1"].value, "红冲（红字→蓝票）配对结果汇总")
+            self.assertEqual((sheet["B3"].value, sheet["B5"].value), (1, 1))
+            self.assertEqual(sheet["B10"].value, 3)
+            self.assertEqual(sheet["E10"].value, missing_number)
+            self.assertIsNone(sheet["F10"].value)
+            self.assertEqual(sheet["H10"].value, "蓝票不在本表")
+            self.assert_red_row(sheet, 10)
+            self.assert_red_row(workbook["发票"], 3)
+            workbook.close()
+        self.run_case()
+        refreshed = load_workbook(self.input_path)
+        self.addCleanup(refreshed.close)
+        self.assertEqual(refreshed.sheetnames.count(sheet_name), 1)
+
+    def test_reversal_snapshot_rejects_changed_source_sheet(self):
+        self.make_workbook(invoices=[invoice(红票标志="红票",
+                                            备注="被红冲蓝字数电发票号码：26447200000089100664")])
+        original_bytes = self.input_path.read_bytes()
+        annotate = reconciliation._annotate_source
+
+        def corrupt_reversal(*args, **kwargs):
+            result = annotate(*args, **kwargs)
+            args[0][args[4]]["B10"] = "已篡改"
+            return result
+
+        with patch("reconciliation._annotate_source", side_effect=corrupt_reversal):
+            with self.assertRaisesRegex(RuntimeError, "红冲配对结果切页内容或标色错误"):
+                self.run_case()
+        self.assertEqual(self.input_path.read_bytes(), original_bytes)
+        self.assertFalse(list(self.directory.glob("*_核对前备份_*.xlsx")))
+
+    def test_invoice_audit_can_use_original_workbook(self):
         self.make_workbook()
-        with self.assertRaisesRegex(reconciliation.ReconciliationError, "不能是同一个文件"):
-            self.run_case(invoice_audit_path=self.input_path)
+        self.assertEqual(self.run_case(invoice_audit_path=self.input_path)["matched"], 1)
         locked = self.directory / "~$invoiceList_2026-10-24.xlsx"
         locked.touch()
         with self.assertRaisesRegex(reconciliation.ReconciliationError, "临时锁定文件"):
@@ -345,6 +465,10 @@ class ReconciliationContractTests(unittest.TestCase):
         self.assertEqual([result["counterpart"] for result in fuel_rows], [f"'{station}'!A3", f"'{station}'!A4"])
         self.assertIn(f"对应发票切页“{station}”第4行（发票号码：I11）", fuel_rows[1]["failure_reason"])
         self.assertIn(f"'{station}'!A4", Path(summary["log_path"]).read_text(encoding="utf-8"))
+        source = load_workbook(self.input_path)
+        self.addCleanup(source.close)
+        self.assertNotIn(station, source.sheetnames)
+        self.assertIn("对应发票切页“发票”第3行（发票号码：I11）", source["加油明细记录"]["U6"].value)
 
         workbook = load_workbook(summary["output_path"])
         self.addCleanup(workbook.close)
@@ -436,6 +560,38 @@ class ReconciliationContractTests(unittest.TestCase):
                 self.assertEqual(result["status"], status)
                 self.assertEqual(result["red"], delta != 0)
                 self.assertEqual(self.decimal(result["amount_diff"]), delta)
+
+    def test_non_manual_invoice_with_wrong_amount_is_not_paired(self):
+        number = "26447200000085594027"
+        self.make_workbook(
+            [fuel(油站名称="加华明珠加油站", 枪号=8, 油品=95, 加油量=47.85,
+                  交易金额=423.47, 交易时间=datetime(2026, 10, 4, 11, 28, 27))],
+            [invoice(数电票号码=number, 开票方式="API调用", 数量=61.12,
+                     开票时间="2026-10-03 22:35:41",
+                     备注="加油站点：加华明珠加油站 交易时间：2026-10-03 22:35:33 油枪号：8",
+                     **{"合计金额（含税）": 571.47})],
+        )
+        summary = self.run_case(start_text="2026-10-03", end_text="2026-10-04")
+        result = self.one_fuel_result(summary)
+        self.assertEqual((summary["paired"], summary["red_invoice"]), (0, 1))
+        self.assertEqual(result["status"], "无对应记录")
+        self.assertFalse(result["counterpart"])
+        self.assertFalse(result["invoice_number"])
+        self.assertNotIn(number, result["failure_reason"])
+        for path in (self.input_path, Path(summary["output_path"])):
+            workbook = load_workbook(path)
+            self.assertIsNone(workbook["加油明细记录"]["V5"].value)
+            self.assert_yellow_row(workbook["发票"], 3)
+            workbook.close()
+
+    def test_manual_invoice_can_still_show_amount_difference(self):
+        for method, expected in (("手工开票（网页端）", "金额不符"), ("API调用", "无对应记录"),
+                                 ("自动开票", "无对应记录"), ("", "无对应记录")):
+            with self.subTest(method=method):
+                self.make_workbook(invoices=[invoice(开票方式=method, **{"合计金额（含税）": 100.01})])
+                result = self.one_fuel_result(self.run_case())
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(bool(result["counterpart"]), expected == "金额不符")
 
     def test_configuration_cannot_bypass_exact_amount_comparison(self):
         parameters = inspect.signature(run_reconciliation).parameters
@@ -801,11 +957,44 @@ class ReconciliationContractTests(unittest.TestCase):
         self.assert_red_row(fuel_sheet, 6)
         invoice_sheet = source["发票"]
         self.assertIsNone(invoice_sheet["A3"].fill.fill_type)
-        self.assert_red_row(invoice_sheet, 4)
+        self.assert_yellow_row(invoice_sheet, 4)
         output = load_workbook(summary["output_path"])
         self.addCleanup(output.close)
-        self.assert_red_row(output["发票"], 4)
+        self.assert_yellow_row(output["发票"], 4)
         self.assertEqual(output["加油明细记录"].cell(5, 22).value, invoice()["数电票号码"])
+
+    def test_source_sheet_titles_show_record_counts_and_amounts_on_rerun(self):
+        self.make_workbook(
+            [fuel(), fuel(枪号=5, 交易时间=datetime(2026, 10, 11, 11), 交易金额=50, 流水号="F002"),
+             fuel(枪号=6, 交易时间=datetime(2026, 10, 11, 12), 交易金额=70, 流水号="F003")],
+            [invoice(备注="加油站点：加华样例站 交易时间：2026-10-11 10:00:00 油枪号：4"),
+             invoice(数电票号码="I002", 数量=10,
+                                备注="加油站点：加华样例站 交易时间：2026-10-11 11:00:00 油枪号：5",
+                                开票时间="2026-10-11 11:00:30", **{"合计金额（含税）": 50}),
+             invoice(数电票号码="I003", 数量=10,
+                     备注="加油站点：加华样例站 交易时间：2026-10-11 13:00:00 油枪号：7",
+                     开票时间="2026-10-11 13:00:30", **{"合计金额（含税）": 80})],
+        )
+        first = self.run_case(show_sheet_totals=True)
+        fuel_title = "加油明细记录2笔150.00元"
+        invoice_title = "发票记录2张150.00元"
+        for path in (self.input_path, Path(first["output_path"])):
+            workbook = load_workbook(path)
+            self.assertEqual(workbook.sheetnames[:3], [fuel_title, invoice_title, "Sheet1"])
+            self.assertEqual(workbook[fuel_title]["A4"].value, "油站名称")
+            workbook.close()
+        source = load_workbook(self.input_path)
+        source[invoice_title]["G4"] = 51
+        source.save(self.input_path)
+        source.close()
+        second = self.run_case(show_sheet_totals=True)
+        refreshed = load_workbook(self.input_path)
+        self.addCleanup(refreshed.close)
+        self.assertEqual(refreshed.sheetnames[:3], ["加油明细记录1笔100.00元", "发票记录1张100.00元", "Sheet1"])
+        self.assertEqual(refreshed.sheetnames.count(reconciliation.ANNOTATION_SHEET), 1)
+        self.assertEqual(second["source_sheet_titles"],
+                         {"fuel": "加油明细记录1笔100.00元", "invoice": "发票记录1张100.00元"})
+        self.assertEqual(scan_invoice_metadata(self.input_path)[0], ["加华样例站"])
 
     def test_rerun_refreshes_existing_annotations_without_duplicate_columns(self):
         self.make_workbook(invoices=[invoice(**{"合计金额（含税）": 100.01})])
@@ -828,7 +1017,7 @@ class ReconciliationContractTests(unittest.TestCase):
         self.assertIsNone(fuel_sheet["A5"].fill.fill_type)
         self.assertEqual(source.sheetnames.count(reconciliation.ANNOTATION_SHEET), 1)
 
-    def test_source_station_sheet_marks_unpaired_invoices_and_refreshes_on_rerun(self):
+    def test_station_sheet_stays_in_result_and_legacy_source_copy_is_removed_on_rerun(self):
         station = "加华明珠加油站"
         self.make_workbook(
             [fuel(油站名称=station)],
@@ -837,16 +1026,21 @@ class ReconciliationContractTests(unittest.TestCase):
                      开票时间="2026-10-11 11:00:30", 数电票号码="I-unpaired")],
         )
         first = self.run_case(selected_stations=[station])
-        for path in (self.input_path, Path(first["output_path"])):
-            workbook = load_workbook(path)
-            station_sheet = workbook[station]
-            self.assertEqual(station_sheet.cell(2, INVOICE_TIME_COLUMN).value, "交易时间")
-            self.assertEqual(station_sheet.cell(3, INVOICE_HEADERS.index("数电票号码") + 1).value, "I-match")
-            self.assertIsNone(station_sheet["A3"].fill.fill_type)
-            self.assertEqual(station_sheet.cell(4, INVOICE_HEADERS.index("数电票号码") + 1).value, "I-unpaired")
-            self.assert_red_row(station_sheet, 4)
-            workbook.close()
+        output = load_workbook(first["output_path"])
+        station_sheet = output[station]
+        self.assertEqual(station_sheet.cell(2, INVOICE_TIME_COLUMN).value, "交易时间")
+        self.assertEqual(station_sheet.cell(3, INVOICE_HEADERS.index("数电票号码") + 1).value, "I-match")
+        self.assertIsNone(station_sheet["A3"].fill.fill_type)
+        self.assertEqual(station_sheet.cell(4, INVOICE_HEADERS.index("数电票号码") + 1).value, "I-unpaired")
+        self.assert_yellow_row(station_sheet, 4)
+        output.close()
         source = load_workbook(self.input_path)
+        self.assertNotIn(station, source.sheetnames)
+        legacy_sheet = source.create_sheet(station)
+        legacy_sheet["A1"] = "旧版油站切页"
+        metadata = source[reconciliation.ANNOTATION_SHEET]
+        metadata["E1"] = 1
+        metadata["D2"] = station
         source["加油明细记录"].append([fuel(油站名称=station, 交易时间=datetime(2026, 10, 11, 11), 流水号="F002").get(label)
                                           for label in FUEL_HEADERS])
         source.save(self.input_path)
@@ -854,10 +1048,13 @@ class ReconciliationContractTests(unittest.TestCase):
         second = self.run_case(selected_stations=[station])
         refreshed = load_workbook(self.input_path)
         self.addCleanup(refreshed.close)
-        self.assertEqual(refreshed.sheetnames.count(station), 1)
-        self.assertEqual(refreshed.sheetnames[-2:], [station, reconciliation.ANNOTATION_SHEET])
-        self.assertEqual(refreshed[station].max_row, 4)
-        self.assertIsNone(refreshed[station]["A4"].fill.fill_type)
+        self.assertNotIn(station, refreshed.sheetnames)
+        self.assertEqual(refreshed.sheetnames[-1], reconciliation.ANNOTATION_SHEET)
+        self.assertEqual(refreshed[reconciliation.ANNOTATION_SHEET]["E1"].value, 0)
+        refreshed_output = load_workbook(second["output_path"])
+        self.addCleanup(refreshed_output.close)
+        self.assertEqual(refreshed_output[station].max_row, 4)
+        self.assertIsNone(refreshed_output[station]["A4"].fill.fill_type)
         self.assertEqual(second["matched"], 2)
 
     def test_rerun_restores_original_fills_when_failures_are_resolved(self):
@@ -868,7 +1065,7 @@ class ReconciliationContractTests(unittest.TestCase):
         original.close()
         self.run_case()
         workbook = load_workbook(self.input_path)
-        self.assertEqual(workbook["发票"]["A3"].fill.fgColor.rgb, reconciliation.RED)
+        self.assertEqual(workbook["发票"]["A3"].fill.fgColor.rgb, reconciliation.YELLOW)
         workbook["加油明细记录"].append([fuel().get(label) for label in FUEL_HEADERS])
         workbook.save(self.input_path)
         workbook.close()
@@ -878,6 +1075,72 @@ class ReconciliationContractTests(unittest.TestCase):
         self.addCleanup(refreshed.close)
         self.assertEqual(refreshed["发票"]["A3"].fill.fgColor.rgb, "FFCCE5FF")
         self.assertIsNone(refreshed["加油明细记录"]["U5"].value)
+
+    def test_reissued_manual_invoice_is_only_suggested_and_marked_yellow(self):
+        station = "中南加华明珠油站"
+        blue_number = "26442000011317394640"
+        manual_number = "26442000011317394641"
+        self.make_workbook(
+            [fuel(油站名称="加华明珠加油站", 交易时间=datetime(2026, 10, 11, 16, 20, 32),
+                  交易金额=270, 加油量=30, 油品=95, 枪号=8)],
+            [invoice(数电票号码=blue_number, 部门门店=station, 数量=30,
+                     开票时间="2026-10-11 16:21:00", **{"合计金额（含税）": 270}),
+             invoice(数电票号码="26442000011317394642", 红票标志="红票", 部门门店=station,
+                     备注=f"被红冲蓝字数电发票号码：{blue_number}", 开票时间="2026-10-11 16:22:00"),
+             invoice(数电票号码=manual_number, 部门门店=station, 数量=30,
+                     商品名称="*汽油*95#车用汽油", 备注="", 开票时间="2026-10-11 16:37:39",
+                     **{"合计金额（含税）": 270})],
+        )
+        summary = self.run_case(selected_stations=[station])
+        self.assertEqual((summary["total_fuel"], summary["total_invoice"], summary["matched"]), (1, 1, 0))
+        fuel_result = self.one_fuel_result(summary)
+        self.assertEqual(fuel_result["status"], "无对应记录")
+        self.assertFalse(fuel_result["counterpart"])
+        self.assertIn(f"疑似找到发票号{manual_number}", fuel_result["failure_reason"])
+        self.assertIn("发票原切页第5行", fuel_result["failure_reason"])
+        self.assertFalse(fuel_result["invoice_number"])
+        for path in (self.input_path, Path(summary["output_path"])):
+            workbook = load_workbook(path)
+            fuel_sheet = workbook["加油明细记录"]
+            self.assertIn(manual_number, fuel_sheet["U5"].value)
+            self.assertIsNone(fuel_sheet["V5"].value)
+            self.assert_red_row(fuel_sheet, 5)
+            self.assert_red_row(workbook["发票"], 3)
+            self.assert_red_row(workbook["发票"], 4)
+            self.assert_yellow_row(workbook["发票"], 5)
+            if path != self.input_path:
+                station_sheet = workbook[summary["station_sheets"][station]]
+                self.assert_yellow_row(station_sheet, 5)
+                self.assert_yellow_row(workbook[summary["unpaired_invoice_sheet"]], 3)
+            else:
+                self.assertNotIn(station, workbook.sheetnames)
+            workbook.close()
+        changed = load_workbook(self.input_path)
+        changed["发票"].cell(5, INVOICE_HEADERS.index("合计金额（含税）") + 1, 271)
+        changed.save(self.input_path)
+        changed.close()
+        refreshed_summary = self.run_case(selected_stations=[station])
+        refreshed = load_workbook(self.input_path)
+        self.addCleanup(refreshed.close)
+        self.assertNotIn(manual_number, refreshed["加油明细记录"]["U5"].value)
+        self.assertIsNone(refreshed["加油明细记录"]["V5"].value)
+        self.assert_yellow_row(refreshed["发票"], 5)
+        self.assertEqual(refreshed_summary["matched"], 0)
+
+    def test_ambiguous_manual_invoice_suggestions_are_not_shown(self):
+        station = "中南加华明珠油站"
+        self.make_workbook(
+            [fuel(油站名称="加华明珠加油站", 交易时间=datetime(2026, 10, 11, 16, 20, 32),
+                  交易金额=270, 加油量=30, 油品=95)],
+            [invoice(数电票号码=f"I{index}", 部门门店=station, 数量=30,
+                     备注="", 开票时间=f"2026-10-11 16:{minute}:39", **{"合计金额（含税）": 270})
+             for index, minute in ((1, 37), (2, 38))],
+        )
+        summary = self.run_case(selected_stations=[station])
+        self.assertNotIn("疑似找到发票号", self.one_fuel_result(summary)["failure_reason"])
+        source = load_workbook(self.input_path)
+        self.addCleanup(source.close)
+        self.assertIsNone(source["加油明细记录"]["V5"].value)
 
     def test_existing_annotation_columns_without_metadata_are_rejected(self):
         self.make_workbook()
@@ -910,6 +1173,48 @@ class ReconciliationContractTests(unittest.TestCase):
         self.assertEqual(list((self.output_directory / "logs").glob("*.log")), [])
         self.assertFalse(list(self.input_path.parent.glob(".加华标注中_*.xlsx")))
         self.assertEqual(len(list(self.input_path.parent.glob("*_核对前备份_*.xlsx"))), 1)
+
+    def test_open_input_is_rejected_before_creating_backup_or_output(self):
+        self.make_workbook()
+        original_bytes = self.input_path.read_bytes()
+        with patch("reconciliation.check_input_file_available",
+                   side_effect=reconciliation.ReconciliationError("源文件已被打开")):
+            with self.assertRaisesRegex(reconciliation.ReconciliationError, "源文件已被打开"):
+                self.run_case()
+        self.assertEqual(self.input_path.read_bytes(), original_bytes)
+        self.assertFalse(self.output_directory.exists())
+        self.assertFalse(list(self.directory.glob("*_核对前备份_*.xlsx")))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows file-sharing check")
+    def test_open_workbook_handle_is_detected_before_reconciliation(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.make_workbook()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(str(self.input_path), 0x80000000, 0, None, 3, 0, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+        try:
+            with self.assertRaisesRegex(reconciliation.ReconciliationError, "源文件已被"):
+                self.run_case()
+        finally:
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle(handle)
+        self.assertFalse(self.output_directory.exists())
+
+    def test_operator_999_and_9999_are_still_annotated_when_unmatched(self):
+        self.make_workbook([fuel(操作员=999, 流水号="F001"),
+                            fuel(操作员=9999, 流水号="F002")], [])
+        summary = self.run_case()
+        self.assertEqual((summary["total_fuel"], summary["red_fuel"]), (2, 2))
+        source = load_workbook(self.input_path)
+        self.addCleanup(source.close)
+        self.assert_red_row(source["加油明细记录"], 5)
+        self.assert_red_row(source["加油明细记录"], 6)
 
     def test_failed_source_verification_keeps_input_unchanged(self):
         self.make_workbook()
@@ -1028,12 +1333,25 @@ class ReconciliationContractTests(unittest.TestCase):
             [fuel(), fuel(交易时间=datetime(2026, 10, 11, 12), 流水号="F002")],
             [invoice(), invoice(备注="交易时间：2026-10-11 12:00:00 油枪号：4", 数电票号码="26447200000093907129", **{"合计金额（含税）": 100.01})],
         )
-        summary = self.run_case()
+        stages = []
+        summary = self.run_case(workflow_progress=lambda message, percent: stages.append((message, percent)))
         expected_reason = "对应发票切页“发票”第4行（发票号码：26447200000093907129）"
         self.assertIn(expected_reason, self.fuel_results(summary)[1]["failure_reason"])
         log = Path(summary["log_path"]).read_text(encoding="utf-8")
         self.assertGreaterEqual(summary["elapsed_seconds"], 0)
         self.assertIn(f"核对耗时：{summary['elapsed_text']}", log)
+        self.assertIn("分段耗时（秒）：", log)
+        for key in ("invoice_scan", "read_parse", "matching", "result_build", "result_save",
+                    "result_preserve", "result_verify", "result_verify_input_load", "result_verify_output_load",
+                    "result_verify_checks", "reversal_sheet_copy", "source_annotation", "source_save",
+                    "source_preserve", "source_verify", "source_verify_annotated_load",
+                    "source_verify_original_load", "source_verify_checks", "backup"):
+            self.assertGreaterEqual(summary["phase_seconds"][key], 0)
+        self.assertIn("结果校验逐项检查", log)
+        self.assertIn("源文件校验逐项检查", log)
+        self.assertLessEqual(summary["phase_seconds"]["reversal_sheet_copy"],
+                             summary["phase_seconds"]["source_annotation"])
+        self.assertEqual([percent for _, percent in stages], [80, 85, 90, 91, 92, 94, 95])
         self.assertEqual(len(summary["results"]), 4)
         for result in summary["results"]:
             marker = f"[{result['source']}!A{result['row']}]"

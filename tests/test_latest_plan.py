@@ -16,7 +16,7 @@ from openpyxl import load_workbook
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import test_reconciliation as fixtures  # noqa: E402
-from reconciliation import run_reconciliation  # noqa: E402
+from reconciliation import parse_period, run_reconciliation  # noqa: E402
 
 
 class LatestPlanTests(unittest.TestCase):
@@ -33,6 +33,7 @@ class LatestPlanTests(unittest.TestCase):
         fixtures.ReconciliationContractTests.make_workbook(self, fuels, invoices, footer)
 
     def run_case(self, **options):
+        options.setdefault("show_sheet_totals", False)
         summary = run_reconciliation(self.input_path, self.output_directory, **options)
         self.assertTrue(Path(summary["output_path"]).is_file())
         return summary
@@ -82,6 +83,11 @@ class LatestPlanTests(unittest.TestCase):
         self.make_workbook()
         self.assertEqual(self.first_fuel(self.run_case(date_text="2026-10-11"))["status"], "已匹配")
 
+    def test_default_end_time_includes_fractional_final_second(self):
+        period = parse_period("", "2026-10-07", "2026-10-07 23:59:59")
+        self.assertEqual(period.end, datetime(2026, 10, 7, 23, 59, 59, 999999))
+        self.assertTrue(period.contains(datetime(2026, 10, 7, 23, 59, 59, 500000)))
+
     def test_parallel_workers_preserve_results_and_report_progress(self):
         fuels = [fixtures.fuel(枪号=index, 流水号=f"F{index:03d}") for index in range(1, 13)]
         invoices = [fixtures.invoice(
@@ -100,7 +106,7 @@ class LatestPlanTests(unittest.TestCase):
         self.assertIn((1, 5, 12), progress)
         self.assertEqual(progress[-1], (3, 12, 12))
         self.assertTrue(all(0 <= done <= total == 12 for _, done, total in progress))
-        self.assertEqual([percent for _, percent in workflow], [80, 90, 95])
+        self.assertEqual([percent for _, percent in workflow], [80, 85, 90, 91, 92, 94, 95])
 
     def test_invalid_worker_count_is_rejected(self):
         self.make_workbook()
@@ -351,7 +357,7 @@ class LatestPlanTests(unittest.TestCase):
                     if is_fuel:
                         self.assert_red_row(sheet, result["row"])
                     elif not result["counterpart"]:
-                        self.assert_red_row(sheet, result["row"])
+                        fixtures.ReconciliationContractTests.assert_yellow_row(self, sheet, result["row"])
                     else:
                         self.assertTrue(all(cell.fill.fill_type is None for cell in sheet[result["row"]]))
 
